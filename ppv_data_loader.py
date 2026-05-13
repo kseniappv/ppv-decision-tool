@@ -422,7 +422,91 @@ def _unpack_active_triplet(
     return (t[0], t[1], t[2])
 
 
-def _parse_spending_dataframe(df_raw: pd.DataFrame) -> Dict[int, Dict[str, Dict[str, Optional[float]]]]:
+def _score_category_display_name_column(col: str, id_col: str) -> int:
+    """
+    Pick one display-name column when exports use different naming (see score order).
+    Headers are normalized via ``_normalize_columns`` (e.g. ``category level 3`` → ``category_level_3``).
+    """
+    if str(col).strip() == str(id_col).strip():
+        return -1
+    c = str(col).strip().lower().replace("__", "_")
+    if c == "category_id":
+        return -1
+
+    if c == "beautiful_name" or c.endswith("_beautiful_name") or "beautiful_name" in c:
+        return 200
+    if c == "category_name" or c.endswith("_category_name"):
+        return 190
+
+    for n in (5, 4, 3, 2, 1):
+        token = f"category_level_{n}"
+        if c == token or c.endswith("_" + token):
+            return 181 + n
+
+    if (
+        c == "category_level_parent"
+        or c.endswith("_category_level_parent")
+        or "category_level_parent" in c
+    ):
+        return 165
+
+    if "category_title" in c:
+        return 88
+    if "category_label" in c:
+        return 82
+    if "subcategory" in c and "id" not in c:
+        return 70
+    return 0
+
+
+def _pick_category_display_name_column(
+    df: pd.DataFrame,
+    id_col: str,
+    *,
+    skip_cols: Optional[set[str]] = None,
+) -> Optional[str]:
+    skip = (skip_cols or set()) | {id_col}
+    best: Optional[Tuple[int, str]] = None
+    for c in df.columns:
+        if c in skip:
+            continue
+        s = _score_category_display_name_column(str(c), id_col)
+        if s <= 0:
+            continue
+        cand = (s, str(c))
+        if best is None or cand[0] > best[0] or (
+            cand[0] == best[0] and len(cand[1]) > len(best[1])
+        ):
+            best = cand
+    return None if best is None else best[1]
+
+
+def _extract_category_display_names_from_spending_df(
+    df: pd.DataFrame,
+    id_col: str,
+    *,
+    skip_cols: Optional[set[str]] = None,
+) -> Dict[int, str]:
+    """Map category_id → label from spending columns (beautiful/category_name/category_level_* / parent)."""
+    skip = set(skip_cols or set()) | {id_col}
+    name_col = _pick_category_display_name_column(df, id_col, skip_cols=skip)
+    if name_col is None:
+        return {}
+    out: Dict[int, str] = {}
+    for _, row in df.iterrows():
+        cid = _coerce_category_id(row[id_col])
+        if cid is None:
+            continue
+        val = row.get(name_col)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        raw = str(val).strip()
+        if raw and raw.lower() != "nan":
+            out[int(cid)] = raw
+    return out
+
+
+def _parse_spending_dataframe(df_raw: pd.DataFrame) -> Tuple[Dict[int, Dict[str, Dict[str, Optional[float]]]], Dict[int, str]]:
     df_raw = _maybe_promote_inline_header_row_spending_active(df_raw)
     df, _ = _normalize_columns(df_raw)
     id_col = _resolve_category_id_column(df)
@@ -487,7 +571,14 @@ def _parse_spending_dataframe(df_raw: pd.DataFrame) -> Dict[int, Dict[str, Dict[
             bucket["after"][mkey] = _parse_number(row[target_col])
             if baseline_col:
                 bucket["baseline"][mkey] = _parse_number(row[baseline_col])
-        return out
+        _skip_nm = {id_col}
+        for _c in (measure_col, default_col, target_col, baseline_col):
+            if _c:
+                _skip_nm.add(_c)
+        _cat_names = _extract_category_display_names_from_spending_df(
+            df, id_col, skip_cols=_skip_nm
+        )
+        return out, _cat_names
 
     # Wide format: suffix _default/_before and _target/_after
     wide_before: Dict[int, Dict[str, Optional[float]]] = {}
@@ -552,7 +643,10 @@ def _parse_spending_dataframe(df_raw: pd.DataFrame) -> Dict[int, Dict[str, Dict[
             bucket["after"][mk] = wide_after.get(cid, {}).get(mk)
             bucket["baseline"][mk] = wide_baseline.get(cid, {}).get(mk)
 
-    return out
+    _cat_names = _extract_category_display_names_from_spending_df(
+        df, id_col, skip_cols={id_col}
+    )
+    return out, _cat_names
 
 
 def _parse_active_dataframe(
@@ -870,9 +964,9 @@ def load_and_merge_data(
     Load three exports and merge spending + active listers by category_id.
 
     Returns:
-        merged_data: category_id -> {"baseline": {...}, "before": {...}, "after": {...}}
-            Core keys per side: paid_users, spending, active_listers (+ other spending metrics).
-            ``baseline`` is filled when the export includes Baseline/Reference columns (else zeros in UI).
+        merged_data: category_id -> ``baseline`` / ``before`` / ``after`` / optional ``category_name``
+            (label from spending file, e.g. ``category_level_3``).
+
         price_data: category_id -> {"default": {...}, "target": {...}}  (not merged into merged_data)
     """
     spending_path, active_path, price_path = Path(spending_file), Path(active_file), Path(price_file)
@@ -881,7 +975,7 @@ def load_and_merge_data(
     active_df = _read_table(active_path)
     price_df = _read_table(price_path)
 
-    spending_by_id = _retry_if_missing_category_id(
+    spending_by_id, spending_category_names = _retry_if_missing_category_id(
         spending_path, spend_df, _parse_spending_dataframe
     )
     active_by_id = _retry_if_missing_category_id(
@@ -911,6 +1005,9 @@ def load_and_merge_data(
             "before": {**sb, "active_listers": abefore},
             "after": {**sa, "active_listers": aafter},
         }
+        _cnm = spending_category_names.get(_kid)
+        if _cnm:
+            merged[_kid]["category_name"] = _cnm
 
     price_data = {int(k): v for k, v in price_data.items()}
     return merged, price_data
@@ -928,7 +1025,7 @@ def load_and_merge_spending_active(
     spend_df = _read_table(spending_path)
     active_df = _read_table(active_path)
 
-    spending_by_id = _retry_if_missing_category_id(
+    spending_by_id, spending_category_names = _retry_if_missing_category_id(
         spending_path, spend_df, _parse_spending_dataframe
     )
     active_by_id = _retry_if_missing_category_id(
@@ -951,5 +1048,8 @@ def load_and_merge_spending_active(
             "before": {**sb, "active_listers": abefore},
             "after": {**sa, "active_listers": aafter},
         }
+        _cnm = spending_category_names.get(_kid)
+        if _cnm:
+            merged[_kid]["category_name"] = _cnm
 
     return merged

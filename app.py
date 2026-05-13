@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import importlib
+import inspect
 import math
 import os
 import re
@@ -17,6 +18,7 @@ from decision_engine import (
     analyze_category,
     classify_change,
     decode_status,
+    get_decision,
 )
 from number_format import (
     format_delta,
@@ -34,12 +36,141 @@ from ppv_data_loader import (
 
 _LAYOUT_COMPACT_CSS = """
 <style>
+/* layout="wide" + readable line length; was 1180px and negated wide mode */
 .main .block-container {
-    max-width: 1120px !important;
+    max-width: min(1720px, 100%) !important;
     margin-left: auto !important;
     margin-right: auto !important;
-    padding-left: 1.5rem !important;
-    padding-right: 1.5rem !important;
+    padding-left: clamp(1rem, 2.2vw, 1.75rem) !important;
+    padding-right: clamp(1rem, 2.2vw, 1.75rem) !important;
+    padding-top: 0.75rem !important;
+}
+.main h1 {
+    margin-bottom: 0.25rem !important;
+    padding-bottom: 0 !important;
+}
+.main hr,
+[data-testid="stHorizontalRule"],
+[data-testid="stMarkdownContainer"] hr {
+    margin-top: 0.55rem !important;
+    margin-bottom: 0.55rem !important;
+}
+.sd-page-lead {
+    color: var(--secondary-text-color, #94a3b8);
+    font-size: 0.95rem;
+    margin: 0 0 0.5rem 0;
+}
+.sd-h2 {
+    font-size: 1.05rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--secondary-text-color, #94a3b8) !important;
+    margin: 0.85rem 0 0.35rem 0 !important;
+}
+.sd-h2-tight { margin-top: 0.45rem !important; margin-bottom: 0.3rem !important; }
+.sd-h2-first { margin-top: 0.15rem !important; }
+.sd-bordered-strip-title {
+    font-size: 0.92rem !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--secondary-text-color, #94a3b8) !important;
+    margin: 0 0 0.35rem 0 !important;
+    padding: 0 !important;
+}
+.sd-dash-card {
+    background: rgba(148,163,184,0.08);
+    border: 1px solid rgba(148,163,184,0.22);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+}
+.sd-mini-kpis {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.sd-mini-kpi {
+    flex: 1 1 140px;
+    min-width: 120px;
+    background: rgba(15,23,42,0.35);
+    border: 1px solid rgba(148,163,184,0.2);
+    border-radius: 10px;
+    padding: 10px 12px;
+}
+.sd-mini-kpi-label { font-size: 0.72rem; text-transform: uppercase; opacity: 0.75; margin-bottom: 4px; }
+.sd-mini-kpi-val { font-size: 1.05rem; font-weight: 600; }
+.sd-mini-kpi-sub { font-size: 0.78rem; opacity: 0.8; margin-top: 4px; }
+.sd-pot-card {
+    background: rgba(15,23,42,0.28);
+    border: 1px solid rgba(148,163,184,0.18);
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+}
+.sd-pot-card h4 { margin: 0 0 8px 0; font-size: 0.95rem; }
+.sd-pot-metrics { display: flex; flex-wrap: wrap; gap: 12px 20px; }
+.sd-pot-m { min-width: 90px; }
+.sd-pot-m span { display: block; font-size: 0.7rem; text-transform: uppercase; opacity: 0.72; }
+.sd-pot-m strong { font-size: 1rem; }
+.sd-hero-wrap {
+    border-radius: 14px;
+    padding: 20px 22px;
+    margin: 12px 0 16px 0;
+    border: 1px solid transparent;
+}
+.sd-hero-title { font-size: 1.05rem; font-weight: 600; opacity: 0.85; margin-bottom: 8px; }
+.sd-hero-decision { font-size: 1.65rem; font-weight: 700; line-height: 1.25; }
+.sd-hero-positive { background: rgba(22,163,74,0.18); border-color: rgba(34,197,94,0.45); }
+.sd-hero-negative { background: rgba(220,38,38,0.16); border-color: rgba(248,113,113,0.45); }
+.sd-hero-neutral { background: rgba(234,179,8,0.14); border-color: rgba(250,204,21,0.35); }
+.sd-hero-muted { background: rgba(148,163,184,0.12); border-color: rgba(148,163,184,0.28); }
+.sd-code-pill {
+    display: inline-block;
+    font-family: ui-monospace, monospace;
+    font-size: 0.88rem;
+    padding: 4px 10px;
+    border-radius: 8px;
+    background: rgba(148,163,184,0.12);
+    border: 1px solid rgba(148,163,184,0.25);
+}
+.sd-next-card {
+    border-radius: 12px;
+    padding: 16px 18px;
+    background: rgba(59,130,246,0.10);
+    border: 1px solid rgba(59,130,246,0.28);
+    margin-top: 12px;
+}
+.sd-next-card p { margin: 0; line-height: 1.55; }
+
+/* Softer dataframe chrome; use full column width (semantic cell styling unchanged) */
+[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: visible;
+    border: 1px solid rgba(148,163,184,0.18);
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
+}
+[data-testid="stDataFrame"] .glideDataEditor,
+[data-testid="stDataFrame"] canvas {
+    max-height: none !important;
+}
+/* Expanders — slightly taller summary row for a "toolbar aligned" strip in Inputs + manual */
+.main [data-testid="stExpander"] details summary {
+    min-height: 2.65rem;
+}
+/* Wide analytics tables: avoid flex column clamping the dataframe */
+[data-testid="column"] {
+    min-width: 0;
+}
+@media (max-width: 768px) {
+    .main .block-container {
+        padding-left: max(0.75rem, env(safe-area-inset-left)) !important;
+        padding-right: max(0.75rem, env(safe-area-inset-right)) !important;
+    }
 }
 </style>
 """
@@ -70,6 +201,45 @@ _CY_INPUT_METRICS = (
     ("active_listers", "Active Listers", "int"),
 )
 
+_CY_DK_TYPE: dict[str, str] = {dk: typ for dk, _, typ in _CY_INPUT_METRICS}
+
+
+def _cy_alias_regex_pattern(al: str) -> str:
+    """Avoid false positives for very short aliases (e.g. cpu inside other tokens)."""
+    e = re.escape(al.lower())
+    if len(al) <= 4 and al.isascii() and re.fullmatch(r"[a-z]+", al.lower() or ""):
+        return rf"(?<![a-z0-9]){e}(?![a-z0-9])"
+    return e
+
+
+def _cy_alias_search(line: str, al: str) -> re.Match | None:
+    return re.search(_cy_alias_regex_pattern(al), line, re.I)
+
+
+def _cy_pair_equal(
+    b1: float | None, a1: float | None, b2: float | None, a2: float | None, eps: float = 0.51
+) -> bool:
+    if b1 is None or a1 is None or b2 is None or a2 is None:
+        return False
+    try:
+        return abs(float(b1) - float(b2)) < eps and abs(float(a1) - float(a2)) < eps
+    except (TypeError, ValueError):
+        return False
+
+
+def _cy_try_set_metric(
+    result: dict[str, dict[str, float | None]], dk: str, b: float, a: float
+) -> bool:
+    """Assign only if values pass semantic plausibility for this metric."""
+    typ = _CY_DK_TYPE.get(dk, "float")
+    if not _cy_pair_semantically_plausible(dk, typ, b, a):
+        return False
+    cur = result.get(dk) or {}
+    if cur.get("before") is not None and cur.get("after") is not None:
+        return False
+    result[dk] = {"before": b, "after": a}
+    return True
+
 
 def _scenario_is_new_category(scenario: str) -> bool:
     return scenario == "New category"
@@ -79,15 +249,42 @@ def _scenario_is_py_anomaly(scenario: str) -> bool:
     return scenario == "Previous Year anomaly"
 
 
+def _scenario_is_other_category(scenario: str) -> bool:
+    return scenario == "Other category"
+
+
 def _cy_sess_key(data_key: str) -> str:
     return "active" if data_key == "active_listers" else data_key
 
 
-def _cy_diff_semantic_style(val):
+def _parse_category_ids(text: str):
     """
-    Сводная таблица %: светлая семантика — рост зелёным, падение красным.
-    Интенсивность фона от модуля изменения; для шкалы используется clamp |v| до 100%
-    (выбросы 1000%+ не «пересвечивают»). Около нуля — без стиля; малые |v| — только цвет текста.
+    Parse category IDs from textarea (newline, comma, semicolon, whitespace).
+    Returns (valid_unique_ids_in_order, invalid_tokens).
+    """
+    if text is None or not str(text).strip():
+        return [], []
+    raw = str(text).strip()
+    parts = [p for p in re.split(r"[\s,\n;]+", raw) if p]
+    valid = []
+    invalid = []
+    seen = set()
+    for p in parts:
+        try:
+            v = int(p)
+            if v not in seen:
+                seen.add(v)
+                valid.append(v)
+        except ValueError:
+            invalid.append(p)
+    return valid, invalid
+
+
+def _metric_summary_diff_pct_style(val):
+    """
+    Metric summary «Diff %» (CY After vs Before): readable light-theme cells.
+    Positive → light green / dark green; negative → light red / dark red;
+    small |v| ≤ 0.5% → light yellow / amber; NA → no style.
     """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
@@ -96,37 +293,22 @@ def _cy_diff_semantic_style(val):
     except (TypeError, ValueError):
         return ""
 
-    near_zero = 0.5
-    if abs(v) <= near_zero:
-        return ""
-
-    intensity = min(abs(v), 100.0) / 100.0
-    text_only_if_below = 2.0
-    use_text_only = abs(v) < text_only_if_below
-
-    def _lerp_channel(c0: int, c1: int, t: float) -> int:
-        return int(round(c0 + (c1 - c0) * t))
-
-    if v > 0:
-        lo_bg = (240, 253, 244)
-        hi_bg = (167, 243, 208)
-        text_hex = "#166534"
-        if use_text_only:
-            return f"color: {text_hex};"
-        r = _lerp_channel(lo_bg[0], hi_bg[0], intensity)
-        g = _lerp_channel(lo_bg[1], hi_bg[1], intensity)
-        b = _lerp_channel(lo_bg[2], hi_bg[2], intensity)
-        return f"background-color: rgb({r},{g},{b}); color: {text_hex};"
-
-    lo_bg = (254, 242, 242)
-    hi_bg = (254, 202, 202)
-    text_hex = "#991b1b"
-    if use_text_only:
-        return f"color: {text_hex};"
-    r = _lerp_channel(lo_bg[0], hi_bg[0], intensity)
-    g = _lerp_channel(lo_bg[1], hi_bg[1], intensity)
-    b = _lerp_channel(lo_bg[2], hi_bg[2], intensity)
-    return f"background-color: rgb({r},{g},{b}); color: {text_hex};"
+    strong = "font-weight: 650; border-radius: 6px; padding: 2px 8px;"
+    small = 0.5
+    if abs(v) <= small:
+        return (
+            strong
+            + "background-color: #fef9c3; color: #92400e; border: 1px solid rgba(234,179,8,0.55);"
+        )
+    if v > small:
+        return (
+            strong
+            + "background-color: #dcfce7; color: #166534; border: 1px solid rgba(34,197,94,0.45);"
+        )
+    return (
+        strong
+        + "background-color: #fee2e2; color: #991b1b; border: 1px solid rgba(248,113,113,0.55);"
+    )
 
 
 def _write_upload_to_temp(uploaded_file) -> str:
@@ -143,295 +325,12 @@ def _write_upload_to_temp(uploaded_file) -> str:
 _apply_desktop_layout()
 
 st.title("PPV Decision Tool 🚀")
-st.caption("Введите данные и нажмите **Calculate** для расчёта.")
+st.markdown(
+    '<p class="sd-page-lead">PPV experiment decision support — structured inputs, analytics, and outcome in one flow.</p>',
+    unsafe_allow_html=True,
+)
 
-with st.expander("Current Year files", expanded=True):
-    spending_file = st.file_uploader("New PPV (spending)", type=["xlsx", "csv"])
-    _uf1, _uf2 = st.columns(2)
-    with _uf1:
-        active_file = st.file_uploader("Active listers", type=["xlsx", "csv"])
-    with _uf2:
-        price_file = st.file_uploader("Price per day", type=["xlsx", "csv"])
-
-merged_data = {}
-price_data = {}
-if spending_file and active_file and price_file:
-    upload_sig = (
-        getattr(spending_file, "name", "") or "",
-        getattr(spending_file, "size", None) or len(spending_file.getvalue()),
-        getattr(active_file, "name", "") or "",
-        getattr(active_file, "size", None) or len(active_file.getvalue()),
-        getattr(price_file, "name", "") or "",
-        getattr(price_file, "size", None) or len(price_file.getvalue()),
-    )
-    if st.session_state.get("_upload_sig") != upload_sig:
-        paths = []
-        try:
-            paths = [
-                _write_upload_to_temp(spending_file),
-                _write_upload_to_temp(active_file),
-                _write_upload_to_temp(price_file),
-            ]
-            merged_data, price_data = load_and_merge_data(paths[0], paths[1], paths[2])
-            st.session_state["merged_data"] = merged_data
-            st.session_state["price_data"] = price_data
-            st.session_state["_upload_sig"] = upload_sig
-            st.session_state["_merge_files_dirty"] = True
-        finally:
-            for p in paths:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-else:
-    st.session_state.pop("merged_data", None)
-    st.session_state.pop("price_data", None)
-    st.session_state.pop("_upload_sig", None)
-    st.session_state.pop("_merge_files_dirty", None)
-
-merged_data = st.session_state.get("merged_data") or {}
-price_data = st.session_state.get("price_data") or {}
-
-with st.expander("Previous Year files", expanded=False):
-    py_spending_file = st.file_uploader(
-        "Previous Year New PPV (spending)",
-        type=["xlsx", "csv"],
-        key="py_spending_uploader",
-    )
-    py_active_file = st.file_uploader(
-        "Previous Year Active listers",
-        type=["xlsx", "csv"],
-        key="py_active_uploader",
-    )
-
-if py_spending_file and py_active_file:
-    py_upload_sig = (
-        getattr(py_spending_file, "name", "") or "",
-        getattr(py_spending_file, "size", None) or len(py_spending_file.getvalue()),
-        getattr(py_active_file, "name", "") or "",
-        getattr(py_active_file, "size", None) or len(py_active_file.getvalue()),
-    )
-    if st.session_state.get("_upload_sig_py") != py_upload_sig:
-        py_paths = []
-        try:
-            py_paths = [
-                _write_upload_to_temp(py_spending_file),
-                _write_upload_to_temp(py_active_file),
-            ]
-            _merged_py = load_and_merge_spending_active(py_paths[0], py_paths[1])
-            st.session_state["merged_data_previous_year"] = _merged_py
-            st.session_state["_upload_sig_py"] = py_upload_sig
-            st.session_state["_py_merge_dirty"] = True
-        finally:
-            for p in py_paths:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-else:
-    st.session_state.pop("merged_data_previous_year", None)
-    st.session_state.pop("_upload_sig_py", None)
-    st.session_state.pop("_py_merge_dirty", None)
-
-merged_data_previous_year = st.session_state.get("merged_data_previous_year") or {}
-
-with st.container(border=True):
-    st.markdown("##### Настройки")
-    set_left, set_right = st.columns(2)
-    with set_left:
-        geo = st.selectbox("GEO", options=["default", "KG", "AZ", "RS"], index=0)
-        category_input = st.text_area(
-            "Category ID",
-            height=72,
-            key="ppv_category_ids_textarea",
-            placeholder="Один ID или несколько через запятую, пробел или новую строку",
-        )
-        scenario = st.radio(
-            "Scenario",
-            [
-                "Regular",
-                "Low NPL (<10)",
-                "Other category",
-                "New category",
-                "Previous Year anomaly",
-            ],
-            horizontal=True,
-        )
-        if _scenario_is_new_category(scenario):
-            st.date_input(
-                "Category creation date",
-                value=date.today(),
-                key="category_creation_date",
-                help=(
-                    "Used when category is less than 1 year old and Previous Year data is unavailable"
-                ),
-            )
-        elif _scenario_is_py_anomaly(scenario):
-            st.text_area(
-                "Previous Year anomaly description",
-                key="py_anomaly_description",
-                placeholder="Describe the anomaly in Previous Year data",
-                help=(
-                    "Used when Previous Year data exists but should not be used "
-                    "as a reliable Y2Y baseline"
-                ),
-                height=72,
-            )
-    with set_right:
-        st.date_input(
-            "Release date",
-            value=date.today(),
-            key="release_date",
-        )
-        st.caption("Периоды (справочно, не участвуют в расчёте).")
-        cy_col1, cy_col2 = st.columns(2)
-        with cy_col1:
-            with st.container(border=True):
-                st.markdown("**Current Year**")
-                r1, r2 = st.columns(2)
-                with r1:
-                    st.date_input("Before from", value=date.today(), key="cy_before_from")
-                with r2:
-                    st.date_input("Before to", value=date.today(), key="cy_before_to")
-                r3, r4 = st.columns(2)
-                with r3:
-                    st.date_input("After from", value=date.today(), key="cy_after_from")
-                with r4:
-                    st.date_input("After to", value=date.today(), key="cy_after_to")
-        with cy_col2:
-            with st.container(border=True):
-                st.markdown("**Previous Year**")
-                pr1, pr2 = st.columns(2)
-                with pr1:
-                    st.date_input("Before from", value=date.today(), key="py_before_from")
-                with pr2:
-                    st.date_input("Before to", value=date.today(), key="py_before_to")
-                pr3, pr4 = st.columns(2)
-                with pr3:
-                    st.date_input("After from", value=date.today(), key="py_after_from")
-                with pr4:
-                    st.date_input("After to", value=date.today(), key="py_after_to")
-
-if scenario != "Regular":
-    if scenario == "Low NPL (<10)":
-        st.info("Low NPL mode is enabled: analysis will run with forced low NPL scenario.")
-    elif scenario == "Other category":
-        st.info("Other category mode is enabled: analysis will run with Other category scenario.")
-    elif _scenario_is_new_category(scenario):
-        st.info(
-            "New category mode: category is under one year old with no Previous Year baseline; "
-            "PY/Y2Y are optional and shown as unavailable in analytics."
-        )
-    elif _scenario_is_py_anomaly(scenario):
-        st.info(
-            "Previous Year anomaly mode: PY values may appear for reference, but Y2Y and "
-            "Potential Spendings that rely on PY trends are excluded."
-        )
-
-st.divider()
-
-
-def _extract_metrics_from_text(text):
-    clean_text = text.lower()
-    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
-
-    parsed = {
-        "paid_users_before": None,
-        "paid_users_after": None,
-        "spending_before": None,
-        "spending_after": None,
-        "active_before": None,
-        "active_after": None,
-    }
-
-    aliases = {
-        "paid_users": ["new paid listers", "paid listers", "paid users", "npl"],
-        "sp": ["spendings", "spending", "revenue", "gmv", "sp"],
-        "active": ["active listers", "active", "actives"],
-    }
-
-    def _parse_num(value):
-        value = value.replace(" ", "")
-        if "," in value and "." in value:
-            value = value.replace(",", "")
-        else:
-            value = value.replace(",", ".")
-        return float(value)
-
-    def _find_before_after_numbers(line):
-        before_match = re.search(r"before[^0-9-]*(-?\d[\d\s.,]*)", line)
-        after_match = re.search(r"after[^0-9-]*(-?\d[\d\s.,]*)", line)
-        if before_match and after_match:
-            return _parse_num(before_match.group(1)), _parse_num(after_match.group(1))
-        return None
-
-    # Most precise case: metric + "before/after" on the same line.
-    for line in lines:
-        pair = _find_before_after_numbers(line)
-        if not pair:
-            continue
-        before, after = pair
-
-        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
-            parsed["paid_users_before"] = int(before)
-            parsed["paid_users_after"] = int(after)
-        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
-            parsed["spending_before"] = before
-            parsed["spending_after"] = after
-        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
-            parsed["active_before"] = int(before)
-            parsed["active_after"] = int(after)
-
-    # Fallback 1: metric line with first two numbers.
-    for line in lines:
-        numbers = re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", line)
-        if len(numbers) < 2:
-            continue
-        before = _parse_num(numbers[0])
-        after = _parse_num(numbers[1])
-
-        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
-            parsed["paid_users_before"] = int(before)
-            parsed["paid_users_after"] = int(after)
-        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
-            parsed["spending_before"] = before
-            parsed["spending_after"] = after
-        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
-            parsed["active_before"] = int(before)
-            parsed["active_after"] = int(after)
-
-    # Fallback 2: OCR split rows into separate lines -> look around alias line.
-    for i, line in enumerate(lines):
-        window = " ".join(lines[i : i + 3])
-        numbers = re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", window)
-        if len(numbers) < 2:
-            continue
-        before = _parse_num(numbers[0])
-        after = _parse_num(numbers[1])
-        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
-            parsed["paid_users_before"] = int(before)
-            parsed["paid_users_after"] = int(after)
-        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
-            parsed["spending_before"] = before
-            parsed["spending_after"] = after
-        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
-            parsed["active_before"] = int(before)
-            parsed["active_after"] = int(after)
-
-    # Fallback 3: sequential numbers in expected order.
-    flat_numbers = [_parse_num(n) for n in re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", clean_text)]
-    if any(value is None for value in parsed.values()) and len(flat_numbers) >= 6:
-        if parsed["paid_users_before"] is None:
-            parsed["paid_users_before"] = int(flat_numbers[0])
-            parsed["paid_users_after"] = int(flat_numbers[1])
-        if parsed["spending_before"] is None:
-            parsed["spending_before"] = flat_numbers[2]
-            parsed["spending_after"] = flat_numbers[3]
-        if parsed["active_before"] is None:
-            parsed["active_before"] = int(flat_numbers[4])
-            parsed["active_after"] = int(flat_numbers[5])
-
-    return parsed
+st.markdown('<p class="sd-h2 sd-h2-first">Inputs</p>', unsafe_allow_html=True)
 
 
 def _decode_optional_image_bytes(uploaded_file, paste_text: str) -> tuple[bytes | None, str | None]:
@@ -890,30 +789,59 @@ def _cy_collect_pp_numeric_rows(left: str) -> list[tuple[float, float]]:
 
 def _cy_fill_from_row_order_if_empty(left: str, result: dict[str, dict[str, float | None]]) -> None:
     """
-    When metric names are missing (tight crop), map rows 1..11 and optional row 12
-    to CY metrics in _CY_INPUT_METRICS order (incl. Active Listers last).
-    Only runs if no metric was fully resolved by name.
+    Fallback when labels are unreadable or the Active Listers mini-table OCR is noisy:
+
+    * Map rows [0..10] → first 11 _CY_INPUT_METRICS only for keys that still have **no** values.
+    * Row [11] → active_listers if still entirely empty.
+
+    Previously we bailed whenever *any* metric was resolved, so Active Listers stayed blank
+    whenever Paid users / Spending / etc. matched by label — rows 12 never ran.
     """
-    filled = sum(
-        1
-        for dk, _, _ in _CY_INPUT_METRICS
-        if (result.get(dk) or {}).get("before") is not None
-        and (result.get(dk) or {}).get("after") is not None
-    )
-    if filled > 0:
-        return
     rows = _cy_collect_pp_numeric_rows(left)
-    if len(rows) < 11:
+    if not rows:
         return
+
     keys_in_order = [dk for dk, _, _ in _CY_INPUT_METRICS]
     for i, dk in enumerate(keys_in_order[:11]):
-        if i < len(rows):
-            b, a = rows[i]
-            result[dk] = {"before": b, "after": a}
-    if len(rows) >= 12:
-        dk = "active_listers"
-        b, a = rows[11]
-        result[dk] = {"before": b, "after": a}
+        if i >= len(rows):
+            break
+        cur = result.get(dk) or {}
+        if cur.get("before") is not None or cur.get("after") is not None:
+            continue
+        b, a = rows[i]
+        _cy_try_set_metric(result, dk, b, a)
+
+    dk_al = "active_listers"
+    cur_al = result.get(dk_al) or {}
+    if len(rows) >= 12 and cur_al.get("before") is None and cur_al.get("after") is None:
+        b11, a11 = rows[11]
+        _cy_try_set_metric(result, dk_al, b11, a11)
+
+
+def _cy_tail_to_before_after(tail: str) -> tuple[float | None, float | None]:
+    """Numbers after a matched metric label on one OCR line (PP dashboard row)."""
+    tail = re.sub(r"(?i)\bAI(\d{2,3})\b", r"1\1", tail)
+    scrub = re.sub(r"[^\d\s.,%-]+", " ", tail).strip()
+    b, a = _pp_tail_skip_junk_default_target(scrub)
+    if b is None or a is None:
+        decp = _pp_european_decimal_pair_regex(scrub)
+        if decp[0] is not None and decp[1] is not None:
+            b, a = decp
+    if b is None or a is None:
+        cpu_cor = _pp_corrupt_cpu_decimal_row_pair(tail.strip())
+        if cpu_cor[0] is not None and cpu_cor[1] is not None:
+            b, a = cpu_cor
+    if b is None or a is None:
+        nums_fb: list[float] = []
+        for w in re.findall(r"\S+", scrub):
+            v = _parse_num_ocr(w)
+            if v is not None and _ocr_scalar_plausible(v):
+                nums_fb.append(v)
+        if len(nums_fb) >= 3:
+            b, a = nums_fb[-2], nums_fb[-1]
+        elif len(nums_fb) == 2:
+            b, a = nums_fb[0], nums_fb[1]
+    return b, a
 
 
 def _parse_pp_dashboard_metric_rows(
@@ -946,36 +874,13 @@ def _parse_pp_dashboard_metric_rows(
             if result[dk]["before"] is not None and result[dk]["after"] is not None:
                 continue
             for al in sorted(key_to_aliases[dk], key=len, reverse=True):
-                mx = re.search(re.escape(al), line, re.I)
+                mx = _cy_alias_search(line, al)
                 if not mx:
                     continue
                 tail = line[mx.end() :]
-                # Common OCR: "AI25" instead of "125" in the last column
-                tail = re.sub(r"(?i)\bAI(\d{2,3})\b", r"1\1", tail)
-                scrub = re.sub(r"[^\d\s.,%-]+", " ", tail).strip()
-                b, a = _pp_tail_skip_junk_default_target(scrub)
-                if b is None or a is None:
-                    decp = _pp_european_decimal_pair_regex(scrub)
-                    if decp[0] is not None and decp[1] is not None:
-                        b, a = decp
-                if b is None or a is None:
-                    cpu_cor = _pp_corrupt_cpu_decimal_row_pair(tail.strip())
-                    if cpu_cor[0] is not None and cpu_cor[1] is not None:
-                        b, a = cpu_cor
-                if b is None or a is None:
-                    nums_fb: list[float] = []
-                    for w in re.findall(r"\S+", scrub):
-                        v = _parse_num_ocr(w)
-                        if v is not None and _ocr_scalar_plausible(v):
-                            nums_fb.append(v)
-                    if len(nums_fb) >= 3:
-                        b, a = nums_fb[-2], nums_fb[-1]
-                    elif len(nums_fb) == 2:
-                        b, a = nums_fb[0], nums_fb[1]
-                if b is not None and a is not None:
-                    result[dk]["before"] = b
-                    result[dk]["after"] = a
-                break
+                b, a = _cy_tail_to_before_after(tail)
+                if b is not None and a is not None and _cy_try_set_metric(result, dk, b, a):
+                    break
     return result
 
 
@@ -1075,7 +980,18 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
         if dk == "paid_users":
             extra.extend(["paid users", "paidusers", "npl", "new paid listers"])
         elif dk == "campaign_per_user":
-            extra.extend(["campaign per user", "campaignperuser", "cpu"])
+            extra.extend(
+                [
+                    "campaign per user",
+                    "campaignperuser",
+                    "campaign p user",
+                    "campaign p. user",
+                    "cmp per user",
+                    "cpu",
+                    "сampaign per user",
+                    "campaign ler user",
+                ]
+            )
         elif dk == "new_campaign_cnt":
             extra.extend(["new campaign cnt", "new campaign", "campaign cnt", "newcampaign"])
         elif dk == "price_per_day":
@@ -1113,7 +1029,15 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
                 ["%execution inventory", "execution inventory", "pct execution inventory"]
             )
         elif dk == "active_listers":
-            extra.extend(["active listers", "active lister", "actives"])
+            extra.extend(
+                [
+                    "active listers",
+                    "active lister",
+                    "actives",
+                    "active liste",
+                    "active listen",
+                ]
+            )
         seen = []
         for e in extra:
             e = e.lower().strip()
@@ -1125,6 +1049,56 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
 
 def _get_ocr_cy_aliases():
     return _ocr_aliases_for_cy()
+
+
+def _cy_repair_pct_execution_if_dup_active(
+    result: dict[str, dict[str, float | None]],
+    left: str,
+    aliases: dict[str, tuple[str, ...]],
+) -> None:
+    """
+    When %-Execution is identical to Active listers, the row almost always picked up the wrong block.
+    Drop the duplicate, then re-parse only from lines that explicitly mention execution inventory.
+    """
+    dk_pe = "pct_execution_inventory"
+    dk_al = "active_listers"
+    pe = result.get(dk_pe) or {}
+    al = result.get(dk_al) or {}
+    pb, pa = pe.get("before"), pe.get("after")
+    ab, aa = al.get("before"), al.get("after")
+    if pb is None or pa is None or ab is None or aa is None:
+        return
+    if not _cy_pair_equal(pb, pa, ab, aa):
+        return
+    result[dk_pe] = {"before": None, "after": None}
+    for raw_line in left.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if "active listers" in low:
+            continue
+        if "%execution" not in low and "execution inventory" not in low:
+            continue
+        for aln in sorted(aliases[dk_pe], key=len, reverse=True):
+            mx = _cy_alias_search(line, aln)
+            if not mx:
+                continue
+            tail = line[mx.end() :]
+            b, a = _cy_tail_to_before_after(tail)
+            if b is None or a is None:
+                continue
+            if _cy_try_set_metric(result, dk_pe, b, a):
+                return
+    rows = _cy_collect_pp_numeric_rows(left)
+    if len(rows) < 11:
+        return
+    b10, a10 = rows[10]
+    typ = _CY_DK_TYPE[dk_pe]
+    if not _cy_pair_equal(b10, a10, ab, aa) and _cy_pair_semantically_plausible(
+        dk_pe, typ, b10, a10
+    ):
+        _cy_try_set_metric(result, dk_pe, b10, a10)
 
 
 def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | None]]:
@@ -1156,8 +1130,7 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
                 continue
             b, a = _ocr_try_table_row_for_aliases(line, aliases[dk])
             if b is not None and a is not None:
-                result[dk]["before"] = b
-                result[dk]["after"] = a
+                _cy_try_set_metric(result, dk, b, a)
     # Pass 1: same line, then 2-line window (avoid huge multi-line windows)
     for i, line in enumerate(lines):
         ll = line.lower()
@@ -1170,9 +1143,7 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
             b, a = _try_before_after_pair_from_window(line)
             if b is None or a is None:
                 b, a = _try_before_after_pair_from_window(win2)
-            if b is not None and a is not None:
-                result[dk]["before"] = b
-                result[dk]["after"] = a
+            if b is not None and a is not None and _cy_try_set_metric(result, dk, b, a):
                 break
     # Pass 2: short slice after metric in flattened text (limit cross-row bleed)
     flat = " " + _ocr_flat_text(left).lower() + " "
@@ -1191,9 +1162,29 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
         window = flat[best : min(len(flat), best + 220)]
         b, a = _try_before_after_pair_from_window(window)
         if b is not None and a is not None:
-            result[dk]["before"] = b
-            result[dk]["after"] = a
+            _cy_try_set_metric(result, dk, b, a)
+
     _cy_fill_from_row_order_if_empty(left, result)
+    _cy_repair_pct_execution_if_dup_active(result, left, aliases)
+    # Second "Period Group" block is often Active listers; full text avoids losing it after left-panel crop.
+    _al_pair = result.get("active_listers") or {}
+    if _al_pair.get("before") is None and _al_pair.get("after") is None:
+        _pu_skip = None
+        _pu_ok = result.get("paid_users") or {}
+        if _pu_ok.get("before") is not None and _pu_ok.get("after") is not None:
+            try:
+                _pu_skip = (
+                    float(_pu_ok["before"]),
+                    float(_pu_ok["after"]),
+                )
+            except (TypeError, ValueError):
+                _pu_skip = None
+        _pg_b, _pg_a = _py_period_group_default_target_pair(
+            text,
+            skip_if_matches=_pu_skip,
+        )
+        if _pg_b is not None and _pg_a is not None:
+            result["active_listers"] = {"before": _pg_b, "after": _pg_a}
     return result
 
 
@@ -1378,7 +1369,14 @@ def _cy_pair_semantically_plausible(dk: str, typ: str, b, a) -> bool:
         return False
     mx = max(bf, af)
     if dk == "campaign_per_user":
-        return mx <= 500.0
+        if mx > 500.0:
+            return False
+        tol = max(1e-5 * mx, 0.004)
+        intish_bf = abs(bf - round(bf)) < tol
+        intish_af = abs(af - round(af)) < tol
+        if intish_bf and intish_af and mx >= 8.0:
+            return False
+        return True
     if dk in ("plan_imp_per_campaign", "fact_imp_per_campaign"):
         return mx <= 500_000.0
     if dk == "price_per_day":
@@ -1389,7 +1387,9 @@ def _cy_pair_semantically_plausible(dk: str, typ: str, b, a) -> bool:
         return mx <= 10**15
     if dk == "arp_p_campaign":
         return mx <= 10**7
-    if "pct_" in dk or dk == "pct_execution_inventory":
+    if dk == "pct_execution_inventory":
+        return mx <= 3500
+    if "pct_" in dk:
         return mx <= 10**6
     return mx <= 10**18
 
@@ -2063,6 +2063,527 @@ def _render_ocr_debug_expanders(fb: dict | None, kind: str) -> None:
                 )
 
 
+def _render_ocr_upload_section(category_bulk_mode: bool) -> None:
+    """OCR UI for single vs bulk notice — same keys and rerun behavior as before."""
+    if category_bulk_mode:
+        st.info(
+            "OCR для ручного ввода доступен только в **single analysis** (одна категория). "
+            "В bulk-режиме используйте файлы и таблицу bulk."
+        )
+        return
+    st.caption(
+        "**Current Year** screenshot → поля **Current Year input** (manual override). "
+        "**Previous Year** screenshot → только блок **Previous Year** (матрица, Y2Y, Potential); "
+        "строка Previous Year в матрице **не** заполняется из OCR Current Year. "
+        "**category_id** для OCR не используется — только совпадение по **названию метрики**."
+    )
+    st.caption(
+        "Нативной вставки изображения из буфера (Ctrl+V) в Streamlit **без** отдельного "
+        "JS-компонента или доп. пакетов нет: используйте **загрузку файла** или вставьте "
+        "**data URL** / **base64** в поле ниже (можно получить из DevTools / внешнего конвертера)."
+    )
+    tab_ocr_cy, tab_ocr_py = st.tabs(
+        ["Current Year screenshot", "Previous Year screenshot"]
+    )
+
+    with tab_ocr_cy:
+        up_cy = st.file_uploader(
+            "Файл скриншота (PNG/JPG/JPEG)",
+            type=["png", "jpg", "jpeg"],
+            key="ocr_cy_file_uploader",
+        )
+        paste_cy = st.text_area(
+            "Или вставьте data:image/...;base64,... либо сырой base64",
+            height=72,
+            key="ocr_cy_paste_b64",
+            placeholder="data:image/png;base64,iVBORw0KGgo...",
+        )
+        img_cy, dec_err_cy = _decode_optional_image_bytes(up_cy, paste_cy)
+        if dec_err_cy:
+            st.warning(dec_err_cy)
+        else:
+            _preview_cy = img_cy if img_cy is not None else (
+                up_cy.getvalue() if up_cy is not None else None
+            )
+            if _preview_cy:
+                _ocr_render_screenshot_preview(_preview_cy, label="Current Year")
+
+        if st.button("Распознать и применить к Current Year input", key="ocr_cy_apply_btn"):
+            img_b, err_b = _decode_optional_image_bytes(up_cy, paste_cy)
+            if err_b:
+                st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
+                    None, err_b, {}, [], []
+                )
+                st.session_state["_cy_ocr_override"] = True
+                st.rerun()
+            elif not img_b:
+                st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
+                    None,
+                    "Нет изображения: загрузите файл или вставьте data URL / base64.",
+                    {},
+                    [],
+                    [],
+                )
+                st.session_state["_cy_ocr_override"] = True
+                st.rerun()
+            else:
+                variants, ocr_error = _ocr_collect_tesseract_variants(img_b)
+                if ocr_error:
+                    st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
+                        None, ocr_error, {}, [], []
+                    )
+                else:
+                    parsed = _merge_cy_parsed_from_ocr_variants(variants)
+                    ocr_text = _ocr_pick_preview_text_cy(variants)
+                    applied_labels, dbg_rows = _apply_cy_ocr_parsed_to_session(
+                        st.session_state,
+                        parsed,
+                        mirror_matrix_py=False,
+                    )
+                    st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
+                        ocr_text, None, parsed, applied_labels, dbg_rows
+                    )
+                st.session_state["_cy_ocr_override"] = True
+                st.rerun()
+
+        _render_ocr_feedback_messages(st.session_state.get("_ocr_cy_feedback"))
+        _render_ocr_debug_expanders(st.session_state.get("_ocr_cy_feedback"), "cy")
+
+    with tab_ocr_py:
+        up_py = st.file_uploader(
+            "Файл скриншота (PNG/JPG/JPEG)",
+            type=["png", "jpg", "jpeg"],
+            key="ocr_py_file_uploader",
+        )
+        paste_py = st.text_area(
+            "Или вставьте data:image/...;base64,... либо сырой base64",
+            height=72,
+            key="ocr_py_paste_b64",
+            placeholder="data:image/png;base64,iVBORw0KGgo...",
+        )
+        img_py, dec_err_py = _decode_optional_image_bytes(up_py, paste_py)
+        if dec_err_py:
+            st.warning(dec_err_py)
+        else:
+            _preview_py = img_py if img_py is not None else (
+                up_py.getvalue() if up_py is not None else None
+            )
+            if _preview_py:
+                _ocr_render_screenshot_preview(_preview_py, label="Previous Year")
+
+        if st.button(
+            "Распознать и применить к Previous Year (матрица)",
+            key="ocr_py_apply_btn",
+        ):
+            img_b, err_b = _decode_optional_image_bytes(up_py, paste_py)
+            if err_b:
+                st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
+                    None, err_b, {}, [], []
+                )
+                st.session_state["_py_ocr_override"] = True
+                st.rerun()
+            elif not img_b:
+                st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
+                    None,
+                    "Нет изображения: загрузите файл или вставьте data URL / base64.",
+                    {},
+                    [],
+                    [],
+                )
+                st.session_state["_py_ocr_override"] = True
+                st.rerun()
+            else:
+                variants, ocr_error = _ocr_collect_tesseract_variants(img_b)
+                if ocr_error:
+                    st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
+                        None, ocr_error, {}, [], []
+                    )
+                else:
+                    parsed = _merge_py_parsed_from_ocr_variants(variants)
+                    ocr_text = _ocr_pick_preview_text_py(variants)
+                    applied_labels, dbg_rows = _apply_py_ocr_parsed_to_session(
+                        st.session_state, parsed
+                    )
+                    st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
+                        ocr_text, None, parsed, applied_labels, dbg_rows
+                    )
+                st.session_state["_py_ocr_override"] = True
+                st.rerun()
+
+        _render_ocr_feedback_messages(st.session_state.get("_ocr_py_feedback"))
+        _render_ocr_debug_expanders(st.session_state.get("_ocr_py_feedback"), "py")
+
+
+with st.container():
+    # OCR expander использует bulk/single из предыдущего ввода (см. ключи session_state),
+    # т.к. визуально строка файлов идёт выше строки Category ID / Scenario.
+    _ss_cat_probe = st.session_state.get("ppv_category_ids_textarea", "")
+    _parsed_probe, _ = _parse_category_ids(_ss_cat_probe)
+    _bulk_pick_probe = list(st.session_state.get("bulk_category_multiselect") or [])
+    _bulk_from_text_probe = len(_parsed_probe) > 1
+    _bulk_from_pick_probe = len(_bulk_pick_probe) > 1
+    _category_bulk_mode = _bulk_from_text_probe or _bulk_from_pick_probe
+
+    with st.container(border=True):
+        _ic_ocr, _ic_cy, _ic_py = st.columns(3, gap="small")
+
+        with _ic_ocr:
+            with st.expander("Скрин с данными (OCR)", expanded=False):
+                _render_ocr_upload_section(_category_bulk_mode)
+
+        with _ic_cy:
+            with st.expander("Current Year files", expanded=True):
+                spending_file = st.file_uploader("New PPV (spending)", type=["xlsx", "csv"])
+                _uf1, _uf2 = st.columns(2)
+                with _uf1:
+                    active_file = st.file_uploader("Active listers", type=["xlsx", "csv"])
+                with _uf2:
+                    price_file = st.file_uploader("Price per day", type=["xlsx", "csv"])
+                st.caption(
+                    "Минимум для объединения Current Year — **New PPV (spending)** и **Active listers**. "
+                    "**Price per day** опционален: без него используется тот же merge, что и для Previous Year "
+                    "(только spending + active). Bulk-анализ price не использует."
+                )
+
+        with _ic_py:
+            with st.expander("Previous Year files", expanded=False):
+                py_spending_file = st.file_uploader(
+                    "Previous Year New PPV (spending)",
+                    type=["xlsx", "csv"],
+                    key="py_spending_uploader",
+                )
+                py_active_file = st.file_uploader(
+                    "Previous Year Active listers",
+                    type=["xlsx", "csv"],
+                    key="py_active_uploader",
+                )
+
+    _merged_for_toolbar = st.session_state.get("merged_data") or {}
+    with st.container(border=True):
+        st.markdown(
+            '<p class="sd-bordered-strip-title">Настройки</p>',
+            unsafe_allow_html=True,
+        )
+        _tb_geo, _tb_cat, _tb_sc = st.columns(3, gap="small")
+        with _tb_geo:
+            geo = st.selectbox(
+                "GEO",
+                options=["default", "KG", "AZ", "RS"],
+                index=0,
+                key="ppv_geo_select",
+            )
+        with _tb_cat:
+            category_input = st.text_area(
+                "Category ID",
+                height=60,
+                key="ppv_category_ids_textarea",
+                placeholder="ID или несколько для bulk (запятая / новая строка)",
+            )
+            _bulk_pick_ids: list[int] = []
+            if _merged_for_toolbar and len(_merged_for_toolbar) > 1:
+                _cy_bulk_options_r = sorted(int(k) for k in _merged_for_toolbar.keys())
+                _bulk_pick_ids = st.multiselect(
+                    "Bulk: Category ID из Current Year файла",
+                    options=_cy_bulk_options_r,
+                    default=[],
+                    key="bulk_category_multiselect",
+                )
+        with _tb_sc:
+            scenario = st.selectbox(
+                "Scenario",
+                options=[
+                    "Regular",
+                    "Low NPL (<10)",
+                    "Other category",
+                    "New category",
+                    "Previous Year anomaly",
+                ],
+                key="ppv_global_scenario",
+            )
+    if _scenario_is_new_category(scenario):
+        st.date_input(
+            "Category creation date",
+            value=date.today(),
+            key="category_creation_date",
+            help=(
+                "Used when category is less than 1 year old and Previous Year data is unavailable"
+            ),
+        )
+    elif _scenario_is_py_anomaly(scenario):
+        st.text_area(
+            "Previous Year anomaly description",
+            key="py_anomaly_description",
+            placeholder="Describe the anomaly in Previous Year data",
+            help=(
+                "Used when Previous Year data exists but should not be used "
+                "as a reliable Y2Y baseline"
+            ),
+            height=56,
+        )
+
+    parsed_category_ids, invalid_category_tokens = _parse_category_ids(category_input)
+    if invalid_category_tokens:
+        shown = invalid_category_tokens[:25]
+        extra_ic = " …" if len(invalid_category_tokens) > 25 else ""
+        st.warning(
+            "Не удалось разобрать как целое число: "
+            + ", ".join(repr(t) for t in shown)
+            + extra_ic
+        )
+
+    _bulk_from_text_ic = len(parsed_category_ids) > 1
+    _bulk_from_pick_ic = len(_bulk_pick_ids) > 1
+    _category_bulk_mode = _bulk_from_text_ic or _bulk_from_pick_ic
+
+    merged_data = {}
+    price_data = {}
+    if spending_file and active_file and price_file:
+        upload_sig = (
+            "cy3",
+            getattr(spending_file, "name", "") or "",
+            getattr(spending_file, "size", None) or len(spending_file.getvalue()),
+            getattr(active_file, "name", "") or "",
+            getattr(active_file, "size", None) or len(active_file.getvalue()),
+            getattr(price_file, "name", "") or "",
+            getattr(price_file, "size", None) or len(price_file.getvalue()),
+        )
+        if st.session_state.get("_upload_sig") != upload_sig:
+            paths = []
+            try:
+                paths = [
+                    _write_upload_to_temp(spending_file),
+                    _write_upload_to_temp(active_file),
+                    _write_upload_to_temp(price_file),
+                ]
+                merged_data, price_data = load_and_merge_data(paths[0], paths[1], paths[2])
+                st.session_state["merged_data"] = merged_data
+                st.session_state["price_data"] = price_data
+                st.session_state["_upload_sig"] = upload_sig
+                st.session_state["_merge_files_dirty"] = True
+            finally:
+                for p in paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+    elif spending_file and active_file:
+        upload_sig = (
+            "cy2",
+            getattr(spending_file, "name", "") or "",
+            getattr(spending_file, "size", None) or len(spending_file.getvalue()),
+            getattr(active_file, "name", "") or "",
+            getattr(active_file, "size", None) or len(active_file.getvalue()),
+        )
+        if st.session_state.get("_upload_sig") != upload_sig:
+            paths = []
+            try:
+                paths = [
+                    _write_upload_to_temp(spending_file),
+                    _write_upload_to_temp(active_file),
+                ]
+                merged_data = load_and_merge_spending_active(paths[0], paths[1])
+                st.session_state["merged_data"] = merged_data
+                st.session_state["price_data"] = {}
+                st.session_state["_upload_sig"] = upload_sig
+                st.session_state["_merge_files_dirty"] = True
+            finally:
+                for p in paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+    else:
+        st.session_state.pop("merged_data", None)
+        st.session_state.pop("price_data", None)
+        st.session_state.pop("_upload_sig", None)
+        st.session_state.pop("_merge_files_dirty", None)
+
+    merged_data = st.session_state.get("merged_data") or {}
+    price_data = st.session_state.get("price_data") or {}
+
+    if py_spending_file and py_active_file:
+        py_upload_sig = (
+            getattr(py_spending_file, "name", "") or "",
+            getattr(py_spending_file, "size", None) or len(py_spending_file.getvalue()),
+            getattr(py_active_file, "name", "") or "",
+            getattr(py_active_file, "size", None) or len(py_active_file.getvalue()),
+        )
+        if st.session_state.get("_upload_sig_py") != py_upload_sig:
+            py_paths = []
+            try:
+                py_paths = [
+                    _write_upload_to_temp(py_spending_file),
+                    _write_upload_to_temp(py_active_file),
+                ]
+                _merged_py = load_and_merge_spending_active(py_paths[0], py_paths[1])
+                st.session_state["merged_data_previous_year"] = _merged_py
+                st.session_state["_upload_sig_py"] = py_upload_sig
+                st.session_state["_py_merge_dirty"] = True
+            finally:
+                for p in py_paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+    else:
+        st.session_state.pop("merged_data_previous_year", None)
+        st.session_state.pop("_upload_sig_py", None)
+        st.session_state.pop("_py_merge_dirty", None)
+
+    merged_data_previous_year = st.session_state.get("merged_data_previous_year") or {}
+
+    if _category_bulk_mode:
+        _resolved_single_category_id = None
+        _bulk_effective_category_ids = (
+            list(parsed_category_ids)
+            if _bulk_from_text_ic
+            else sorted(int(x) for x in _bulk_pick_ids)
+        )
+    elif len(parsed_category_ids) == 1:
+        _resolved_single_category_id = int(parsed_category_ids[0])
+        _bulk_effective_category_ids = []
+    elif len(parsed_category_ids) == 0 and merged_data:
+        _bulk_effective_category_ids = []
+        _cy_keys_res = sorted(int(k) for k in merged_data.keys())
+        if len(_cy_keys_res) == 1:
+            _resolved_single_category_id = _cy_keys_res[0]
+            st.caption(
+                f"В файлах одна категория — для Before/After используется **{_resolved_single_category_id}**."
+            )
+        else:
+            _resolved_single_category_id = int(
+                st.selectbox(
+                    "Category ID (Current Year): в файлах несколько категорий — выберите одну категорию для single-анализа",
+                    options=_cy_keys_res,
+                    key="cy_single_category_pick",
+                )
+            )
+    else:
+        _resolved_single_category_id = None
+        _bulk_effective_category_ids = []
+
+    _category_single_mode = _resolved_single_category_id is not None and not _category_bulk_mode
+
+if scenario != "Regular":
+    if scenario == "Low NPL (<10)":
+        st.info("Low NPL mode is enabled: analysis will run with forced low NPL scenario.")
+    elif scenario == "Other category":
+        st.info("Other category mode is enabled: analysis will run with Other category scenario.")
+    elif _scenario_is_new_category(scenario):
+        st.info(
+            "New category mode: category is under one year old with no Previous Year baseline; "
+            "PY/Y2Y are optional and shown as unavailable in analytics."
+        )
+    elif _scenario_is_py_anomaly(scenario):
+        st.info(
+            "Previous Year anomaly mode: PY values may appear for reference, but Y2Y and "
+            "Potential Spendings that rely on PY trends are excluded."
+        )
+
+
+def _extract_metrics_from_text(text):
+    clean_text = text.lower()
+    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+
+    parsed = {
+        "paid_users_before": None,
+        "paid_users_after": None,
+        "spending_before": None,
+        "spending_after": None,
+        "active_before": None,
+        "active_after": None,
+    }
+
+    aliases = {
+        "paid_users": ["new paid listers", "paid listers", "paid users", "npl"],
+        "sp": ["spendings", "spending", "revenue", "gmv", "sp"],
+        "active": ["active listers", "active", "actives"],
+    }
+
+    def _parse_num(value):
+        value = value.replace(" ", "")
+        if "," in value and "." in value:
+            value = value.replace(",", "")
+        else:
+            value = value.replace(",", ".")
+        return float(value)
+
+    def _find_before_after_numbers(line):
+        before_match = re.search(r"before[^0-9-]*(-?\d[\d\s.,]*)", line)
+        after_match = re.search(r"after[^0-9-]*(-?\d[\d\s.,]*)", line)
+        if before_match and after_match:
+            return _parse_num(before_match.group(1)), _parse_num(after_match.group(1))
+        return None
+
+    # Most precise case: metric + "before/after" on the same line.
+    for line in lines:
+        pair = _find_before_after_numbers(line)
+        if not pair:
+            continue
+        before, after = pair
+
+        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
+            parsed["paid_users_before"] = int(before)
+            parsed["paid_users_after"] = int(after)
+        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
+            parsed["spending_before"] = before
+            parsed["spending_after"] = after
+        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
+            parsed["active_before"] = int(before)
+            parsed["active_after"] = int(after)
+
+    # Fallback 1: metric line with first two numbers.
+    for line in lines:
+        numbers = re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", line)
+        if len(numbers) < 2:
+            continue
+        before = _parse_num(numbers[0])
+        after = _parse_num(numbers[1])
+
+        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
+            parsed["paid_users_before"] = int(before)
+            parsed["paid_users_after"] = int(after)
+        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
+            parsed["spending_before"] = before
+            parsed["spending_after"] = after
+        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
+            parsed["active_before"] = int(before)
+            parsed["active_after"] = int(after)
+
+    # Fallback 2: OCR split rows into separate lines -> look around alias line.
+    for i, line in enumerate(lines):
+        window = " ".join(lines[i : i + 3])
+        numbers = re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", window)
+        if len(numbers) < 2:
+            continue
+        before = _parse_num(numbers[0])
+        after = _parse_num(numbers[1])
+        if any(alias in line for alias in aliases["paid_users"]) and parsed["paid_users_before"] is None:
+            parsed["paid_users_before"] = int(before)
+            parsed["paid_users_after"] = int(after)
+        elif any(alias in line for alias in aliases["sp"]) and parsed["spending_before"] is None:
+            parsed["spending_before"] = before
+            parsed["spending_after"] = after
+        elif any(alias in line for alias in aliases["active"]) and parsed["active_before"] is None:
+            parsed["active_before"] = int(before)
+            parsed["active_after"] = int(after)
+
+    # Fallback 3: sequential numbers in expected order.
+    flat_numbers = [_parse_num(n) for n in re.findall(r"-?\d[\d\s]*(?:[.,]\d+)?", clean_text)]
+    if any(value is None for value in parsed.values()) and len(flat_numbers) >= 6:
+        if parsed["paid_users_before"] is None:
+            parsed["paid_users_before"] = int(flat_numbers[0])
+            parsed["paid_users_after"] = int(flat_numbers[1])
+        if parsed["spending_before"] is None:
+            parsed["spending_before"] = flat_numbers[2]
+            parsed["spending_after"] = flat_numbers[3]
+        if parsed["active_before"] is None:
+            parsed["active_before"] = int(flat_numbers[4])
+            parsed["active_after"] = int(flat_numbers[5])
+
+    return parsed
+
+
 def _engine_style_diff(before, after):
     """Match decision_engine.diff: percent change; 0 if before == 0."""
     try:
@@ -2097,6 +2618,13 @@ _BULK_PRIORITY_SORT_ORDER = {
     _BULK_PRIORITY_POSITIVE: 5,
 }
 
+# Same copy as single-mode Calculate when diff Y2Y is required but cannot be completed.
+_BULK_Y2Y_DECISION_UNAVAILABLE_NEXT_STEP = (
+    "Year-over-year comparison is unavailable for one or more metrics. "
+    "Enter Previous Year Paid users, Spending, and Active listers (Before and After) "
+    "so diff Y2Y can be computed for NPL, Spending, and Conversion."
+)
+
 
 def _bulk_row_priority(status: str, final_decision):
     if status == "Missing current year data":
@@ -2114,69 +2642,168 @@ def _bulk_row_priority(status: str, final_decision):
 
 def _bulk_row_warning_flags(
     status: str,
-    final_decision,
+    scenario_used: str,
+    *,
     has_py: bool,
-    is_other_category: bool,
-    is_new_category: bool,
-    is_py_anomaly: bool,
+    y2y_decision_unavailable: bool = False,
+    low_npl_insufficient_sample: bool = False,
 ) -> str:
-    flags = []
-    if final_decision == "Insufficient data":
-        flags.append("LOW_PAID_USERS")
+    """Tokens aligned with bulk scenario_used (MISSING_PY omitted for New/PY anomaly/Other paths)."""
+    flags: list[str] = []
     if status == "Missing current year data":
         flags.append("MISSING_CY")
-    if is_new_category:
+    if low_npl_insufficient_sample:
+        flags.append("LOW_NPL")
+    if y2y_decision_unavailable:
+        flags.append("Y2Y_DECISION_UNAVAILABLE")
+    if scenario_used == "New category":
         flags.append("NEW_CATEGORY")
-    elif is_py_anomaly:
+    elif scenario_used == "Previous Year anomaly":
         flags.append("PY_ANOMALY")
-    elif not has_py:
-        flags.append("MISSING_PY")
-    if is_other_category:
+    elif scenario_used != "Other category" and not has_py:
+        if scenario_used in ("Regular", "Low NPL auto", "Low NPL (<10)"):
+            flags.append("MISSING_PY")
+    if scenario_used == "Other category":
         flags.append("OTHER_CATEGORY")
     return ", ".join(flags)
 
 
+def _bulk_resolve_category_name(data: dict | None) -> str:
+    """Display-only: optional name from merged payload if loaders add metadata later."""
+    if not isinstance(data, dict):
+        return ""
+    for key in (
+        "beautiful_name",
+        "category_name",
+        "category_level_5",
+        "category_level_4",
+        "category_level_3",
+        "category_level_2",
+        "category_level_1",
+        "category_level_parent",
+        "category_title",
+        "category",
+        "title",
+        "name",
+    ):
+        val = data.get(key)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s and s.lower() != "nan":
+            return s
+    return ""
+
+
+def _bulk_lookup_merged_category(merged_data: dict, cid: int):
+    """Return merged bucket for cid; tolerate non-int dict keys after load."""
+    if not merged_data:
+        return None
+    ic = int(cid)
+    if ic in merged_data:
+        return merged_data[ic]
+    for k, v in merged_data.items():
+        try:
+            if int(k) == ic:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+# CY Diff % для доп. метрик spending: формула как у PPV matrix (_matrix_pct_diff); не участвует в decision_engine.
+_BULK_CY_EXTRA_DIFF_PCT_SPECS: tuple[tuple[str, str], ...] = (
+    ("campaign_per_user", "CY Diff % Campaign per User"),
+    ("new_campaign_cnt", "CY Diff % New campaign cnt"),
+    ("price_per_day", "CY Diff % Price per day"),
+    ("arp_p_campaign", "CY Diff % ARPpCampaign"),
+    ("refund", "CY Diff % Refund"),
+    ("pct_campaign_with_refund", "CY Diff % %Campaign with refund"),
+    ("plan_imp_per_campaign", "CY Diff % Plan Imp per Campaign"),
+    ("fact_imp_per_campaign", "CY Diff % Fact Imp per Campaign"),
+    ("pct_execution_inventory", "CY Diff % %Execution Inventory"),
+)
+_BULK_CY_EXTRA_DIFF_COLUMN_NAMES = tuple(c for _, c in _BULK_CY_EXTRA_DIFF_PCT_SPECS)
+
+
+def _bulk_na_extra_cy_diff_pct() -> dict[str, None]:
+    return dict.fromkeys(_BULK_CY_EXTRA_DIFF_COLUMN_NAMES, None)
+
+
+def _bulk_extra_cy_diff_pct_from_buckets(before_bucket, after_bucket) -> dict:
+    """(after−before)/before×100 или None как в матрице."""
+    b = before_bucket or {}
+    a = after_bucket or {}
+    return {
+        cname: _matrix_pct_diff(b.get(mkey), a.get(mkey))
+        for mkey, cname in _BULK_CY_EXTRA_DIFF_PCT_SPECS
+    }
+
+
 def _bulk_analysis_dataframe(
-    parsed_category_ids,
+    category_ids,
     merged_data,
     merged_data_previous_year,
     geo: str,
-    force_low_npl: bool,
-    is_other_category: bool,
-    is_new_category: bool,
-    is_py_anomaly: bool,
+    global_scenario: str,
+    other_override_ids: list,
+    new_override_ids: list,
+    py_anomaly_override_ids: list,
 ):
-    """One row per category_id; CY analyze via analyze_category; PY/Y2Y control diffs."""
+    """One row per category_id; CY/PY/Y2Y числа как прежде; решение и флаги — по scenario_used строки."""
+    other_eff, new_eff, py_eff = _bulk_normalize_override_id_sets(
+        other_override_ids if other_override_ids is not None else [],
+        new_override_ids if new_override_ids is not None else [],
+        py_anomaly_override_ids if py_anomaly_override_ids is not None else [],
+    )
     rows = []
-    for cid in parsed_category_ids:
-        if cid not in merged_data:
+    for cid in category_ids:
+        data = _bulk_lookup_merged_category(merged_data, cid)
+        if data is None:
             _st = "Missing current year data"
-            _has_py = bool(merged_data_previous_year) and cid in merged_data_previous_year
+            _has_py = (
+                bool(merged_data_previous_year)
+                and _bulk_lookup_merged_category(merged_data_previous_year, cid)
+                is not None
+            )
+            su_miss = _bulk_resolve_scenario_used(
+                int(cid),
+                None,
+                global_scenario,
+                override_other_eff=other_eff,
+                override_new_eff=new_eff,
+                override_py_eff=py_eff,
+            )
             rows.append(
                 {
                     "category_id": cid,
+                    "category_name": str(cid),
+                    "scenario_used": su_miss,
                     "priority": _bulk_row_priority(_st, None),
                     "warning_flags": _bulk_row_warning_flags(
-                        _st, None, _has_py, is_other_category, is_new_category, is_py_anomaly
+                        _st, su_miss, has_py=_has_py
                     ),
                     "status": _st,
                     "cy_paid_users_diff": None,
                     "cy_spending_diff": None,
                     "cy_cr_diff": None,
+                    "cy_active_listers_diff": None,
+                    **_bulk_na_extra_cy_diff_pct(),
                     "decision_code": None,
                     "final_decision": None,
                     "next_step": None,
                     "py_paid_users_diff": None,
                     "py_spending_diff": None,
                     "py_cr_diff": None,
+                    "py_active_listers_diff": None,
                     "y2y_paid_users_diff": None,
                     "y2y_spending_diff": None,
                     "y2y_cr_diff": None,
+                    "y2y_active_listers_diff": None,
                 }
             )
             continue
 
-        data = merged_data[cid]
         b = data.get("before") or {}
         a = data.get("after") or {}
         npl_b = int(float(b.get("paid_users") or 0))
@@ -2186,28 +2813,45 @@ def _bulk_analysis_dataframe(
         ac_b = int(float(b.get("active_listers") or 0))
         ac_a = int(float(a.get("active_listers") or 0))
 
+        scenario_used = _bulk_resolve_scenario_used(
+            int(cid),
+            npl_a,
+            global_scenario,
+            override_other_eff=other_eff,
+            override_new_eff=new_eff,
+            override_py_eff=py_eff,
+        )
+        row_is_new = scenario_used == "New category"
+        row_is_py_anom = scenario_used == "Previous Year anomaly"
+        row_is_other = scenario_used == "Other category"
+        row_force_low = scenario_used in ("Low NPL (<10)", "Low NPL auto")
+
+        pd_py = None
+        if not row_is_new and merged_data_previous_year:
+            pd_py = _bulk_lookup_merged_category(merged_data_previous_year, cid)
+
         py_paid_users_diff = None
         py_spending_diff = None
         py_cr_diff = None
-        if (
-            not is_new_category
-            and merged_data_previous_year
-            and cid in merged_data_previous_year
-        ):
-            pd = merged_data_previous_year[cid]
-            pb = pd.get("before") or {}
-            pa = pd.get("after") or {}
+        py_active_listers_diff = None
+        pnpl_b = pnpl_a = None
+        psp_py_b = psp_py_a = None
+        pac_b = pac_a = None
+        if pd_py is not None:
+            pb = pd_py.get("before") or {}
+            pa = pd_py.get("after") or {}
             pnpl_b = int(float(pb.get("paid_users") or 0))
             pnpl_a = int(float(pa.get("paid_users") or 0))
-            psp_b = float(pb.get("spending") or 0)
-            psp_a = float(pa.get("spending") or 0)
+            psp_py_b = float(pb.get("spending") or 0)
+            psp_py_a = float(pa.get("spending") or 0)
             pac_b = int(float(pb.get("active_listers") or 0))
             pac_a = int(float(pa.get("active_listers") or 0))
             py_paid_users_diff = _engine_style_diff(pnpl_b, pnpl_a)
-            py_spending_diff = _engine_style_diff(psp_b, psp_a)
+            py_spending_diff = _engine_style_diff(psp_py_b, psp_py_a)
             pcr_b = _bulk_safe_ratio(pnpl_b, pac_b)
             pcr_a = _bulk_safe_ratio(pnpl_a, pac_a)
             py_cr_diff = _engine_style_diff(pcr_b, pcr_a)
+            py_active_listers_diff = _engine_style_diff(pac_b, pac_a)
 
         result = analyze_category(
             npl_before=npl_b,
@@ -2217,12 +2861,13 @@ def _bulk_analysis_dataframe(
             active_before=ac_b,
             active_after=ac_a,
             geo=geo or "default",
-            force_low_npl=force_low_npl,
-            is_other_category=is_other_category,
+            force_low_npl=row_force_low,
+            is_other_category=row_is_other,
         )
         cy_paid_users_diff = result["npl_diff"]
         cy_spending_diff = result["sp_diff"]
         cy_cr = result["cr_diff"]
+        cy_active_listers_diff = result["active_diff"]
 
         def _y2y(cy_v, py_v):
             if py_v is None or cy_v is None:
@@ -2230,56 +2875,128 @@ def _bulk_analysis_dataframe(
             return cy_v - py_v
 
         _st_ok = ""
-        _fd = result["final_decision"]
-        _has_py = bool(merged_data_previous_year) and cid in merged_data_previous_year
-        if is_py_anomaly:
+        _has_py = pd_py is not None
+        if row_is_py_anom:
             _y2y_paid_users_diff = None
             _y2y_spending_diff = None
             _y2y_cr_diff = None
+            _y2y_active_listers_diff = None
         else:
             _y2y_paid_users_diff = _y2y(cy_paid_users_diff, py_paid_users_diff)
             _y2y_spending_diff = _y2y(cy_spending_diff, py_spending_diff)
             _y2y_cr_diff = _y2y(cy_cr, py_cr_diff)
+            _y2y_active_listers_diff = _y2y(cy_active_listers_diff, py_active_listers_diff)
+
+        # Bulk analysis must use the same primary comparison period as single analysis
+        # to keep decision logic consistent across modes.
+        _matrix_focus_run = (
+            "current_year" if (row_is_new or row_is_py_anom) else "diff_y2y"
+        )
+        _is_other_run = row_is_other
+        _low_npl_override_run = scenario_used == "Low NPL (<10)" or npl_a < 10
+        y2y_decision_unavail = False
+        if _matrix_focus_run == "current_year" or _is_other_run:
+            disp_dc = result["decision_code"]
+            disp_fd = result["final_decision"]
+            disp_ns = result["next_step"]
+        elif pd_py is not None:
+            y2y_bundle = _results_compute_y2y_npl_sp_cr_bundle(
+                geo or "default",
+                npl_b,
+                npl_a,
+                sp_b,
+                sp_a,
+                ac_b,
+                ac_a,
+                pnpl_b,
+                pnpl_a,
+                psp_py_b,
+                psp_py_a,
+                pac_b,
+                pac_a,
+            )
+            if y2y_bundle["complete"]:
+                disp_dc = y2y_bundle["decision_code"]
+                _dr_y2y = get_decision(disp_dc)
+                disp_fd = _dr_y2y["decision"]
+                disp_ns = _dr_y2y["next_step"]
+                if _low_npl_override_run:
+                    disp_fd = result["final_decision"]
+                    disp_ns = result["next_step"]
+            else:
+                y2y_decision_unavail = True
+                disp_dc = "—"
+                disp_fd = "Insufficient data"
+                disp_ns = _BULK_Y2Y_DECISION_UNAVAILABLE_NEXT_STEP
+        else:
+            y2y_decision_unavail = True
+            disp_dc = "—"
+            disp_fd = "Insufficient data"
+            disp_ns = _BULK_Y2Y_DECISION_UNAVAILABLE_NEXT_STEP
+
+        _low_npl_insufficient_flag = (
+            scenario_used != "Other category"
+            and result["final_decision"] == "Insufficient data"
+            and (row_force_low or npl_a < 10)
+        )
+
+        _nm = _bulk_resolve_category_name(data)
         rows.append(
             {
                 "category_id": cid,
-                "priority": _bulk_row_priority(_st_ok, _fd),
+                "category_name": _nm if _nm else str(cid),
+                "scenario_used": scenario_used,
+                "priority": _bulk_row_priority(_st_ok, disp_fd),
                 "warning_flags": _bulk_row_warning_flags(
-                    _st_ok, _fd, _has_py, is_other_category, is_new_category, is_py_anomaly
+                    _st_ok,
+                    scenario_used,
+                    has_py=_has_py,
+                    y2y_decision_unavailable=y2y_decision_unavail,
+                    low_npl_insufficient_sample=_low_npl_insufficient_flag,
                 ),
                 "status": _st_ok,
                 "cy_paid_users_diff": cy_paid_users_diff,
                 "cy_spending_diff": cy_spending_diff,
                 "cy_cr_diff": cy_cr,
-                "decision_code": result["decision_code"],
-                "final_decision": _fd,
-                "next_step": result["next_step"],
+                "cy_active_listers_diff": cy_active_listers_diff,
+                **_bulk_extra_cy_diff_pct_from_buckets(b, a),
+                "decision_code": disp_dc,
+                "final_decision": disp_fd,
+                "next_step": disp_ns,
                 "py_paid_users_diff": py_paid_users_diff,
                 "py_spending_diff": py_spending_diff,
                 "py_cr_diff": py_cr_diff,
+                "py_active_listers_diff": py_active_listers_diff,
                 "y2y_paid_users_diff": _y2y_paid_users_diff,
                 "y2y_spending_diff": _y2y_spending_diff,
                 "y2y_cr_diff": _y2y_cr_diff,
+                "y2y_active_listers_diff": _y2y_active_listers_diff,
             }
         )
 
     cols = [
         "category_id",
+        "category_name",
+        "scenario_used",
         "priority",
-        "warning_flags",
-        "status",
-        "decision_code",
-        "final_decision",
-        "next_step",
         "cy_paid_users_diff",
         "cy_spending_diff",
         "cy_cr_diff",
+        "cy_active_listers_diff",
+        *_BULK_CY_EXTRA_DIFF_COLUMN_NAMES,
         "py_paid_users_diff",
         "py_spending_diff",
         "py_cr_diff",
+        "py_active_listers_diff",
         "y2y_paid_users_diff",
         "y2y_spending_diff",
         "y2y_cr_diff",
+        "y2y_active_listers_diff",
+        "decision_code",
+        "final_decision",
+        "next_step",
+        "warning_flags",
+        "status",
     ]
     df = pd.DataFrame(rows, columns=cols)
     df["_pri_sort"] = df["priority"].map(lambda p: _BULK_PRIORITY_SORT_ORDER.get(p, 99))
@@ -2318,6 +3035,17 @@ def _bulk_render_summary(df: pd.DataFrame) -> None:
     )
     st.metric("Previous Year anomaly (PY_ANOMALY)", py_anomaly_flag_n)
 
+    if "scenario_used" in df.columns:
+        _su = df["scenario_used"]
+        st.markdown("###### scenario_used")
+        _sx1, _sx2, _sx3, _sx4, _sx5, _sx6 = st.columns(6)
+        _sx1.metric("Regular", int((_su == "Regular").sum()))
+        _sx2.metric("New category", int((_su == "New category").sum()))
+        _sx3.metric("PY anomaly", int((_su == "Previous Year anomaly").sum()))
+        _sx4.metric("Other", int((_su == "Other category").sum()))
+        _sx5.metric("Low NPL auto", int((_su == "Low NPL auto").sum()))
+        _sx6.metric("Low NPL (<10)", int((_su == "Low NPL (<10)").sum()))
+
     with st.expander("Разбивка по priority, final_decision, status", expanded=False):
         _e1, _e2, _e3 = st.columns(3)
         with _e1:
@@ -2340,6 +3068,15 @@ def _bulk_render_summary(df: pd.DataFrame) -> None:
             _ss = df["status"].replace({"": "(ok / empty)"})
             st.dataframe(
                 _ss.value_counts().rename_axis("status").reset_index(name="n"),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    if "scenario_used" in df.columns:
+        with st.expander("Разбивка по scenario_used", expanded=False):
+            _suv = df["scenario_used"].fillna("(no data)")
+            st.dataframe(
+                _suv.value_counts().rename_axis("scenario_used").reset_index(name="n"),
                 hide_index=True,
                 use_container_width=True,
             )
@@ -2373,22 +3110,30 @@ def _bulk_apply_table_filters(
     """
     AND across dimensions. If every option is selected for a dimension, that dimension is not applied.
     warning_flags: row matches if intersection of row tokens and selected flags is non-empty (OR).
+    Empty multiselect is treated as “no restriction” so the table does not disappear by accident.
     """
     m = pd.Series(True, index=df.index)
-    if set(sel_priority) != set(all_priority):
-        m &= df["priority"].isin(sel_priority)
-    if set(sel_final_decision) != set(all_final_decision):
+
+    sel_p = sel_priority if sel_priority else list(all_priority)
+    if set(sel_p) != set(all_priority):
+        m &= df["priority"].isin(sel_p)
+
+    sel_fd = sel_final_decision if sel_final_decision else list(all_final_decision)
+    if set(sel_fd) != set(all_final_decision):
         fd_disp = df["final_decision"].apply(
             lambda x: "(no data)" if pd.isna(x) else str(x)
         )
-        m &= fd_disp.isin(sel_final_decision)
-    if all_warning_flags and set(sel_warning_flags) != set(all_warning_flags):
-        sel_w = set(sel_warning_flags)
+        m &= fd_disp.isin(sel_fd)
 
-        def _row_matches_warnings(val):
-            return bool(sel_w & _bulk_warning_token_set(val))
+    if all_warning_flags:
+        sel_wf = sel_warning_flags if sel_warning_flags else list(all_warning_flags)
+        if set(sel_wf) != set(all_warning_flags):
+            sel_w = set(sel_wf)
 
-        m &= df["warning_flags"].apply(_row_matches_warnings)
+            def _row_matches_warnings(val):
+                return bool(sel_w & _bulk_warning_token_set(val))
+
+            m &= df["warning_flags"].apply(_row_matches_warnings)
     return df.loc[m]
 
 
@@ -2416,7 +3161,22 @@ def _bulk_render_insights(df: pd.DataFrame) -> None:
     )
     missing_cy = int((df["status"] == "Missing current year data").sum())
 
+    if "scenario_used" in df.columns:
+        _su = df["scenario_used"]
+        n_reg = int((_su == "Regular").sum())
+        n_new = int((_su == "New category").sum())
+        n_pya = int((_su == "Previous Year anomaly").sum())
+        n_oth = int((_su == "Other category").sum())
+        n_la = int((_su == "Low NPL auto").sum())
+        n_l10 = int((_su == "Low NPL (<10)").sum())
+
     parts = [f"Analyzed **{total}** categories."]
+    if "scenario_used" in df.columns:
+        parts.append(
+            "**scenario_used:** Regular **"
+            f"{n_reg}**, New category **{n_new}**, Previous Year anomaly **{n_pya}**, Other **{n_oth}**, "
+            f"Low NPL auto **{n_la}**, Low NPL (<10) **{n_l10}**."
+        )
     if negative:
         parts.append(f"❌ **{negative}** categories show negative impact.")
     if insufficient:
@@ -2440,6 +3200,35 @@ _BULK_ROW_BG_MISSING_CY = "#e8e8e8"
 _BULK_ROW_BG_NEGATIVE = "#ffd6d6"
 _BULK_ROW_BG_INSUFFICIENT = "#fff3bf"
 _BULK_ROW_BG_POSITIVE = "#d3f9d8"
+_BULK_ROW_BG_NO_IMPACT = "#fff8e1"
+
+
+def _bulk_format_next_step_short(next_step: str) -> str:
+    """
+    Короткая подпись действия для compact summary (полный next_step — в Category details).
+    Эвристики по ключевым фразам; без усечения «первыми словами».
+    """
+    s = str(next_step or "").strip()
+    if not s:
+        return "—"
+    lower = s.lower()
+    if "choose with your teamlead" in lower or "choose with a teamlead" in lower:
+        return "Review with teamlead"
+    if "keep" in lower:
+        return "Keep prices"
+    if "rollback" in lower or "roll back" in lower:
+        return "Rollback"
+    if "increase" in lower or "re-increase" in lower:
+        return "Increase price"
+    if "look for other methods" in lower:
+        return "Find other methods"
+    return "Need review"
+
+
+def _bulk_next_step_short_cell(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "—"
+    return _bulk_format_next_step_short(str(val))
 
 
 def _bulk_row_background(row: pd.Series):
@@ -2456,6 +3245,8 @@ def _bulk_row_background(row: pd.Series):
         return _BULK_ROW_BG_INSUFFICIENT
     if fd == "Positive impact":
         return _BULK_ROW_BG_POSITIVE
+    if fd == "No impact":
+        return _BULK_ROW_BG_NO_IMPACT
     return None
 
 
@@ -2479,18 +3270,24 @@ def _bulk_format_table_for_display(
                 return x
 
         out["category_id"] = out["category_id"].map(_fmt_cat)
+    for _col in _BULK_CY_EXTRA_DIFF_COLUMN_NAMES:
+        if _col in out.columns:
+            out[_col] = out[_col].map(lambda v: format_percent(v))
     _dash_py_y2y = (
         "py_paid_users_diff",
         "py_spending_diff",
         "py_cr_diff",
+        "py_active_listers_diff",
         "y2y_paid_users_diff",
         "y2y_spending_diff",
         "y2y_cr_diff",
+        "y2y_active_listers_diff",
     )
     _dash_y2y_only = (
         "y2y_paid_users_diff",
         "y2y_spending_diff",
         "y2y_cr_diff",
+        "y2y_active_listers_diff",
     )
 
     def _to_dash(val):
@@ -2507,78 +3304,165 @@ def _bulk_format_table_for_display(
     return out
 
 
-def _bulk_styled_dataframe(df: pd.DataFrame):
-    """Row-wise background via pandas Styler (full row repaint per cell)."""
+def _bulk_mask_py_y2y_cells_by_scenario(per_row_df: pd.DataFrame, compact_view: pd.DataFrame) -> pd.DataFrame:
+    """Для смешанного bulk: «—» в PY/Y2Y столбцах построчно по ``scenario_used``."""
+    if per_row_df is None or compact_view is None:
+        return compact_view
+    if per_row_df.empty or compact_view.empty:
+        return compact_view
+    if "scenario_used" not in per_row_df.columns:
+        return compact_view
+    out = compact_view.copy()
+    py_cols = (
+        "py_paid_users_diff",
+        "py_spending_diff",
+        "py_cr_diff",
+        "py_active_listers_diff",
+    )
+    y2y_cols = (
+        "y2y_paid_users_diff",
+        "y2y_spending_diff",
+        "y2y_cr_diff",
+        "y2y_active_listers_diff",
+    )
+    n = min(len(per_row_df), len(out))
+    for pos in range(n):
+        su = str(per_row_df.iloc[pos].get("scenario_used") or "").strip()
+        if su == "New category":
+            tgt = py_cols + y2y_cols
+        elif su == "Previous Year anomaly":
+            tgt = y2y_cols
+        else:
+            continue
+        for c in tgt:
+            if c not in out.columns:
+                continue
+            col_ix = out.columns.get_loc(c)
+            if isinstance(col_ix, (list, tuple)) or getattr(col_ix, "ndim", 0) > 0:
+                continue
+            out.iat[pos, int(col_ix)] = "—"
+    return out
+
+
+def _bulk_styled_dataframe(df: pd.DataFrame, *, style_source: pd.DataFrame | None = None):
+    """Раскраска строк по decision/status и визуальные группы CY / PY / Y2Y.
+
+    Tint — inset box‑shadow поверх ``background-color`` строки (строковый статус сохраняет приоритет).
+    ``style_source`` — полный bulk‑ряд в том же порядке (доступ к ``status`` без колонки в таблице).
+    """
     if df is None or df.empty:
         return df
+    meta = style_source if style_source is not None else df
 
-    def _apply_row_styles(row: pd.Series):
-        bg = _bulk_row_background(row)
+    def _apply_row_styles_fallback(row: pd.Series):
+        try:
+            mrow = meta.iloc[int(row.name)]
+        except (TypeError, ValueError, IndexError, KeyError):
+            mrow = row
+        bg = _bulk_row_background(mrow)
         if not bg:
             return pd.Series([""] * len(row), index=row.index)
-        css = f"background-color: {bg}"
-        return pd.Series([css] * len(row), index=row.index)
+        return pd.Series([f"background-color: {bg}"] * len(row), index=row.index)
 
-    return df.style.apply(_apply_row_styles, axis=1).hide(axis="index")
+    def _cell_grid_styles(data):
+        # axis=None может передать ndarray; для стилизации опираемся на исходный df (та же форма и порядок).
+        _ = data
+        cols_ds = list(df.columns)
+        cy_first = next((c for c in cols_ds if c in _BULK_CY_METRIC_COLUMNS_SET), None)
+        py_first = next((c for c in cols_ds if c in _BULK_PY_METRIC_COLUMNS_SET), None)
+        y2y_first = next((c for c in cols_ds if c in _BULK_Y2Y_METRIC_COLUMNS_SET), None)
+        out = pd.DataFrame("", index=df.index, columns=df.columns)
+
+        for i_pos in range(len(df)):
+            try:
+                mrow = meta.iloc[int(i_pos)]
+            except (TypeError, ValueError, IndexError, KeyError):
+                mrow = df.iloc[int(i_pos)]
+            row_bg = _bulk_row_background(mrow)
+
+            for col in cols_ds:
+                parts: list[str] = []
+                if row_bg:
+                    parts.append(f"background-color: {row_bg}")
+                if col in _BULK_CY_METRIC_COLUMNS_SET:
+                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_CY}")
+                elif col in _BULK_PY_METRIC_COLUMNS_SET:
+                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_PY}")
+                elif col in _BULK_Y2Y_METRIC_COLUMNS_SET:
+                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_Y2Y}")
+                if col == cy_first:
+                    parts.append(f"border-left: {_BULK_GROUP_BORDER_CY}")
+                elif col == py_first:
+                    parts.append(f"border-left: {_BULK_GROUP_BORDER_PY}")
+                elif col == y2y_first:
+                    parts.append(f"border-left: {_BULK_GROUP_BORDER_Y2Y}")
+                ji = cols_ds.index(col)
+                out.iat[i_pos, ji] = "; ".join(parts)
+
+        return out
+
+    sty = df.style
+    try:
+        sty = sty.apply(_cell_grid_styles, axis=None)
+    except (TypeError, ValueError, AttributeError):
+        sty = sty.apply(_apply_row_styles_fallback, axis=1)
+
+    try:
+        return sty.hide(axis="index")
+    except TypeError:
+        return sty.hide_index()
 
 
-def _parse_category_ids(text: str):
-    """
-    Parse category IDs from textarea (newline, comma, semicolon, whitespace).
-    Returns (valid_unique_ids_in_order, invalid_tokens).
-    """
-    if text is None or not str(text).strip():
-        return [], []
-    raw = str(text).strip()
-    parts = [p for p in re.split(r"[\s,\n;]+", raw) if p]
-    valid = []
-    invalid = []
-    seen = set()
-    for p in parts:
-        try:
-            v = int(p)
-            if v not in seen:
-                seen.add(v)
-                valid.append(v)
-        except ValueError:
-            invalid.append(p)
-    return valid, invalid
+def _bulk_normalize_override_id_sets(other_ids: list, new_ids: list, py_anomaly_ids: list):
+    """Other > New category > Previous Year anomaly; lower-priority repeats removed."""
+    so = {int(x) for x in other_ids}
+    sn = {int(x) for x in new_ids}
+    spy = {int(x) for x in py_anomaly_ids}
+    other_eff = set(so)
+    new_eff = sn - other_eff
+    py_eff = spy - other_eff - new_eff
+    return other_eff, new_eff, py_eff
 
 
-parsed_category_ids, invalid_category_tokens = _parse_category_ids(category_input)
-if invalid_category_tokens:
-    shown = invalid_category_tokens[:25]
-    extra = " …" if len(invalid_category_tokens) > 25 else ""
-    st.warning(
-        "Не удалось разобрать как целое число: "
-        + ", ".join(repr(t) for t in shown)
-        + extra
-    )
-
-_category_bulk_mode = len(parsed_category_ids) > 1
-if _category_bulk_mode:
-    _resolved_single_category_id = None
-elif len(parsed_category_ids) == 1:
-    _resolved_single_category_id = int(parsed_category_ids[0])
-elif len(parsed_category_ids) == 0 and merged_data:
-    _cy_keys = sorted(int(k) for k in merged_data.keys())
-    if len(_cy_keys) == 1:
-        _resolved_single_category_id = _cy_keys[0]
-        st.caption(
-            f"В файлах одна категория — для Before/After используется **{_resolved_single_category_id}**."
+def _bulk_override_conflict_messages(so: set[int], sn: set[int], spy: set[int]) -> list[str]:
+    """Explain priority when same ID appears in multiple override boxes (dedup applied anyway)."""
+    msgs: list[str] = []
+    for i in sorted(so & sn):
+        msgs.append(f"Category ID **`{i}`** is in **Other** and **New category** overrides — applying **Other category**.")
+    for i in sorted(so & spy):
+        msgs.append(
+            f"Category ID **`{i}`** is in **Other** and **Previous Year anomaly** overrides — applying **Other category**."
         )
-    else:
-        _resolved_single_category_id = int(
-            st.selectbox(
-                "Category ID (Current Year): в файлах несколько категорий — выберите для анализа",
-                options=_cy_keys,
-                key="cy_single_category_pick",
-            )
+    for i in sorted(sn & spy):
+        msgs.append(
+            f"Category ID **`{i}`** is in **New category** and **Previous Year anomaly** overrides — applying **New category**."
         )
-else:
-    _resolved_single_category_id = None
+    return msgs
 
-_category_single_mode = _resolved_single_category_id is not None and not _category_bulk_mode
+
+def _bulk_resolve_scenario_used(
+    cid: int,
+    paid_users_after: int | None,
+    global_scenario: str,
+    *,
+    override_other_eff: set[int],
+    override_new_eff: set[int],
+    override_py_eff: set[int],
+) -> str:
+    """
+    Per-row scenario for bulk decisions: override lists (priority Other > New > PY anomaly),
+    then auto Low NPL when paid_users_after &lt; 10, else global Scenario from sidebar.
+    """
+    if int(cid) in override_other_eff:
+        return "Other category"
+    if int(cid) in override_new_eff:
+        return "New category"
+    if int(cid) in override_py_eff:
+        return "Previous Year anomaly"
+    if paid_users_after is not None and int(paid_users_after) < 10:
+        return "Low NPL auto"
+    return global_scenario
+
 
 _merge_dirty = st.session_state.pop("_merge_files_dirty", False)
 if _merge_dirty:
@@ -2664,12 +3548,26 @@ if (
 
 if _category_bulk_mode:
     st.subheader("Bulk Category IDs")
-    st.caption("Сводка по списку. Автозаполнение полей и расчёт по кнопке Calculate — только для одного ID.")
-    n = len(parsed_category_ids)
-    in_cy = [i for i in parsed_category_ids if i in merged_data]
-    in_py = [i for i in parsed_category_ids if i in merged_data_previous_year]
-    miss_cy = [i for i in parsed_category_ids if i not in merged_data]
-    miss_py = [i for i in parsed_category_ids if i not in merged_data_previous_year]
+    st.caption(
+        "Сводка по списку. Автозаполнение полей и расчёт по кнопке Calculate — только для одного ID."
+    )
+    st.caption(
+        "В **merged_data** попадают только категории, которые есть **и** в выгрузке spending, **и** "
+        "в выгрузке active listers (**пересечение**). ID только в одном файле здесь не считается «есть в данных»."
+    )
+    n = len(_bulk_effective_category_ids)
+    in_cy = [
+        i
+        for i in _bulk_effective_category_ids
+        if _bulk_lookup_merged_category(merged_data, i) is not None
+    ]
+    in_py = [
+        i
+        for i in _bulk_effective_category_ids
+        if _bulk_lookup_merged_category(merged_data_previous_year, i) is not None
+    ]
+    miss_cy = [i for i in _bulk_effective_category_ids if i not in in_cy]
+    miss_py = [i for i in _bulk_effective_category_ids if i not in in_py]
     st.markdown(
         f"- **Распознано валидных ID:** {n}\n"
         f"- **Есть в Current Year data:** {len(in_cy)}"
@@ -2706,6 +3604,440 @@ def _matrix_pct_diff(before, after):
     return (after - before) / before * 100.0
 
 
+_BULK_TABLE_DETAILS_COL = "Details"
+_BULK_TABLE_DETAILS_CELL = "🔍"
+
+_BULK_SUMMARY_COLUMNS = (
+    "category_id",
+    "category_name",
+    "scenario_used",
+    "cy_paid_users_diff",
+    "cy_spending_diff",
+    "cy_cr_diff",
+    "cy_active_listers_diff",
+    "py_paid_users_diff",
+    "py_spending_diff",
+    "py_cr_diff",
+    "py_active_listers_diff",
+    "y2y_paid_users_diff",
+    "y2y_spending_diff",
+    "y2y_cr_diff",
+    "y2y_active_listers_diff",
+    "final_decision",
+    "next_step",
+)
+
+# Колонки решений в compact‑таблице (для tint / border‑left; без доп. CY spending‑метрик из CSV).
+_BULK_CY_METRIC_COLUMNS = (
+    "cy_paid_users_diff",
+    "cy_spending_diff",
+    "cy_cr_diff",
+    "cy_active_listers_diff",
+)
+_BULK_PY_METRIC_COLUMNS = (
+    "py_paid_users_diff",
+    "py_spending_diff",
+    "py_cr_diff",
+    "py_active_listers_diff",
+)
+_BULK_Y2Y_METRIC_COLUMNS = (
+    "y2y_paid_users_diff",
+    "y2y_spending_diff",
+    "y2y_cr_diff",
+    "y2y_active_listers_diff",
+)
+_BULK_CY_METRIC_COLUMNS_SET = frozenset(_BULK_CY_METRIC_COLUMNS)
+_BULK_PY_METRIC_COLUMNS_SET = frozenset(_BULK_PY_METRIC_COLUMNS)
+_BULK_Y2Y_METRIC_COLUMNS_SET = frozenset(_BULK_Y2Y_METRIC_COLUMNS)
+
+_BULK_GROUP_BORDER_CY = "2px solid rgba(36, 150, 230, 0.42)"
+_BULK_GROUP_BORDER_PY = "2px solid rgba(120, 126, 140, 0.52)"
+_BULK_GROUP_BORDER_Y2Y = "2px solid rgba(132, 99, 210, 0.48)"
+_BULK_GROUP_TINT_CY = "rgba(52, 152, 219, 0.075)"
+_BULK_GROUP_TINT_PY = "rgba(110, 118, 132, 0.085)"
+_BULK_GROUP_TINT_Y2Y = "rgba(124, 92, 217, 0.075)"
+
+def _bulk_compact_column_ui_labels() -> dict[str, str]:
+    """Человекочитаемые заголовки только для compact‑таблицы (CSV / полный bulk_df — internal имена)."""
+    return {
+        "category_id": "Category ID",
+        "category_name": "Category name",
+        "scenario_used": "Scenario",
+        "final_decision": "Decision",
+        "next_step": "Next step",
+        "cy_paid_users_diff": "CY Paid users %",
+        "cy_spending_diff": "CY Spending %",
+        "cy_cr_diff": "CY CR %",
+        "cy_active_listers_diff": "CY Active listers %",
+        "py_paid_users_diff": "PY Paid users %",
+        "py_spending_diff": "PY Spending %",
+        "py_cr_diff": "PY CR %",
+        "py_active_listers_diff": "PY Active listers %",
+        "y2y_paid_users_diff": "Y2Y Paid users Δ",
+        "y2y_spending_diff": "Y2Y Spending Δ",
+        "y2y_cr_diff": "Y2Y CR Δ",
+        "y2y_active_listers_diff": "Y2Y Active listers Δ",
+        _BULK_TABLE_DETAILS_COL: _BULK_TABLE_DETAILS_COL,
+    }
+
+
+
+
+def _bulk_compact_table_column_config(column_names: list[str]) -> dict:
+    labels = _bulk_compact_column_ui_labels()
+    try:
+        tc_params = inspect.signature(st.column_config.TextColumn).parameters
+    except (TypeError, ValueError):
+        tc_params = {}
+    pinned_left = (
+        {"pinned": "left"} if "pinned" in tc_params else {}
+        # pinned: поддерживается не во всех версиях Streamlit (fallback — только горизонтальный скролл без freeze).
+    )
+    frozen = {_BULK_TABLE_DETAILS_COL, "category_id", "category_name", "scenario_used"}
+    cfg: dict = {}
+    for col in column_names:
+        title = labels.get(col, col)
+        td: dict = {}
+        if col == _BULK_TABLE_DETAILS_COL:
+            td = {"width": "small", "help": "Select this row to load details below"}
+        elif col == "category_id":
+            td = {"width": "small"}
+        elif col == "category_name":
+            td = {"width": "medium"}
+        elif col == "scenario_used":
+            td = {
+                "width": "medium",
+                "help": "Effective bulk scenario after overrides and auto Low NPL.",
+            }
+        elif col == "final_decision":
+            td = {"width": "small"}
+        elif col == "next_step":
+            td = {
+                "width": "large",
+                "help": "Full next step is available in Category details.",
+            }
+        elif (
+            col in _BULK_CY_METRIC_COLUMNS_SET
+            | _BULK_PY_METRIC_COLUMNS_SET
+            | _BULK_Y2Y_METRIC_COLUMNS_SET
+        ):
+            td = {"width": "small"}
+        merged = dict(td)
+        if col in frozen:
+            merged = {**pinned_left, **merged}
+        cfg[col] = st.column_config.TextColumn(title, **merged)
+    return cfg
+
+
+def _bulk_mean_numeric_column_mean(df_: pd.DataFrame, col_name: str) -> float | None:
+    if df_ is None or df_.empty or col_name not in df_.columns:
+        return None
+    series = pd.to_numeric(df_[col_name], errors="coerce").dropna()
+    if series.empty:
+        return None
+    return float(series.mean())
+
+
+def _bulk_render_compact_dashboard(df: pd.DataFrame) -> None:
+    """Компактные KPI над таблицей — те же pri/scenario, что Summary (полный bulk_df)."""
+    if df is None or df.empty:
+        return
+    st.markdown("##### Overview")
+
+    pri_vc = df["priority"].value_counts()
+    dc = st.columns(5)
+    with dc[0]:
+        st.metric("Positive impact", int(pri_vc.get(_BULK_PRIORITY_POSITIVE, 0)))
+    with dc[1]:
+        st.metric("No impact", int(pri_vc.get(_BULK_PRIORITY_NO_IMPACT, 0)))
+    with dc[2]:
+        st.metric("Negative impact", int(pri_vc.get(_BULK_PRIORITY_NEGATIVE, 0)))
+    with dc[3]:
+        st.metric("Insufficient data", int(pri_vc.get(_BULK_PRIORITY_INSUFFICIENT, 0)))
+    with dc[4]:
+        st.metric("Missing CY", int(pri_vc.get(_BULK_PRIORITY_MISSING, 0)))
+
+    if "scenario_used" not in df.columns:
+        return
+    _su = df["scenario_used"]
+    sr = [
+        ("Regular", int((_su == "Regular").sum())),
+        ("New category", int((_su == "New category").sum())),
+        ("Previous Year anomaly", int((_su == "Previous Year anomaly").sum())),
+        ("Other category", int((_su == "Other category").sum())),
+        ("Low NPL auto", int((_su == "Low NPL auto").sum())),
+        ("Low NPL (<10)", int((_su == "Low NPL (<10)").sum())),
+    ]
+    sx = st.columns(6)
+    for _i, (_title, _v) in enumerate(sr):
+        with sx[_i]:
+            st.metric(_title, _v)
+
+    m_cy_sp = _bulk_mean_numeric_column_mean(df, "cy_spending_diff")
+    m_y2y_cr = _bulk_mean_numeric_column_mean(df, "y2y_cr_diff")
+    if m_cy_sp is None and m_y2y_cr is None:
+        return
+    ex = st.columns(2)
+    with ex[0]:
+        cy_lbl = format_percent(m_cy_sp) if m_cy_sp is not None else "—"
+        st.metric("Avg CY Spending %", cy_lbl)
+    with ex[1]:
+        y2_lbl = format_percent(m_y2y_cr) if m_y2y_cr is not None else "—"
+        st.metric("Avg Y2Y CR Δ", y2_lbl)
+
+
+_BULK_DETAIL_ADDITIONAL_SPECS = (
+    ("campaign_per_user", "Campaign per User", "float"),
+    ("new_campaign_cnt", "New campaign cnt", "int"),
+    ("price_per_day", "Price per day", "float"),
+    ("arp_p_campaign", "ARPpCampaign", "float"),
+    ("refund", "Refund", "float"),
+    ("pct_campaign_with_refund", "%Campaign with refund", "pct"),
+    ("plan_imp_per_campaign", "Plan Imp per Campaign", "float"),
+    ("fact_imp_per_campaign", "Fact Imp per Campaign", "float"),
+    ("pct_execution_inventory", "%Execution Inventory", "pct"),
+)
+
+def _bulk_dataframe_selection_rows(event) -> list[int]:
+    if event is None:
+        return []
+    try:
+        sel = (
+            event["selection"] if isinstance(event, dict) else getattr(event, "selection", None)
+        )
+        if sel is None:
+            return []
+        rows = sel["rows"] if isinstance(sel, dict) else getattr(sel, "rows", None)
+        if not rows:
+            return []
+        return [int(r) for r in rows]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return []
+
+
+def _bulk_format_compact_diff_pct_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Колонки *\_diff как в матрице: format_percent."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in list(out.columns):
+        if str(col).endswith("_diff"):
+            out[col] = out[col].map(lambda v: format_percent(v))
+    return out
+
+
+def _bulk_cell_primary_bucket(val, *, kind: str) -> str:
+    if kind == "int":
+        try:
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                iv = None
+            else:
+                iv = int(float(val))
+        except (TypeError, ValueError):
+            iv = None
+        return format_matrix_metric(iv, as_int=iv is not None)
+    if kind == "float":
+        try:
+            fv = (
+                float(val)
+                if val is not None and not (isinstance(val, float) and pd.isna(val))
+                else None
+            )
+        except (TypeError, ValueError):
+            fv = None
+        return format_matrix_metric(fv, as_int=False)
+    raise ValueError(f"unexpected kind {kind!r}")
+
+
+def _bulk_cell_pct_bucket(val) -> str:
+    try:
+        fv = (
+            float(val)
+            if val is not None and not (isinstance(val, float) and pd.isna(val))
+            else None
+        )
+    except (TypeError, ValueError):
+        fv = None
+    return format_summary_percent_cell(fv)
+
+
+def _bulk_metrics_primary_detail_df(b, a):
+    """Paid users, Active, Spending, CR — те же типы чисел и Diff % что в PPV matrix."""
+    b = b or {}
+    a = a or {}
+    pn_b, pn_a = b.get("paid_users"), a.get("paid_users")
+    ac_b, ac_a = b.get("active_listers"), a.get("active_listers")
+    sp_b, sp_a = b.get("spending"), a.get("spending")
+    cr_b = _matrix_safe_div(pn_b, ac_b)
+    cr_a = _matrix_safe_div(pn_a, ac_a)
+    rows_build = []
+    for label, bb, aa, bk in (
+        ("Paid users", pn_b, pn_a, "int"),
+        ("Active listers", ac_b, ac_a, "int"),
+        ("Spending", sp_b, sp_a, "float"),
+        ("CR", cr_b, cr_a, "float"),
+    ):
+        rows_build.append(
+            {
+                "Metric": label,
+                "Before": _bulk_cell_primary_bucket(bb, kind=bk),
+                "After": _bulk_cell_primary_bucket(aa, kind=bk),
+                "Diff %": format_percent(_matrix_pct_diff(bb, aa)),
+            }
+        )
+    return pd.DataFrame(rows_build)
+
+
+def _bulk_metrics_additional_detail_df(b, a):
+    b = b or {}
+    a = a or {}
+    rows_build = []
+    for mkey, title, kind in _BULK_DETAIL_ADDITIONAL_SPECS:
+        vb, va = b.get(mkey), a.get(mkey)
+        if kind == "pct":
+            b_s, a_s = _bulk_cell_pct_bucket(vb), _bulk_cell_pct_bucket(va)
+        elif kind == "int":
+            b_s = _bulk_cell_primary_bucket(vb, kind="int")
+            a_s = _bulk_cell_primary_bucket(va, kind="int")
+        else:
+            b_s = _bulk_cell_primary_bucket(vb, kind="float")
+            a_s = _bulk_cell_primary_bucket(va, kind="float")
+        rows_build.append(
+            {
+                "Metric": title,
+                "Before": b_s,
+                "After": a_s,
+                "Diff %": format_percent(_matrix_pct_diff(vb, va)),
+            }
+        )
+    return pd.DataFrame(rows_build)
+
+
+def _bulk_render_category_drill_down(row: pd.Series, merged_data) -> None:
+    """Внутри expander: Metrics / Additional / Decision (без логики decision_engine)."""
+    try:
+        cid = int(row["category_id"])
+        cid_disp = format_integer(cid, group_thousands=True)
+    except (TypeError, ValueError):
+        st.warning("Некорректный category_id.")
+        return
+    data = _bulk_lookup_merged_category(merged_data, cid) if merged_data else None
+    nm = str(row.get("category_name") or "").strip()
+    title_name = nm if nm else "—"
+
+    _sig_ct = inspect.signature(st.container).parameters
+    if "border" in _sig_ct:
+        _outer = st.container(border=True)
+    else:
+        _outer = st.container()
+
+    with _outer:
+        st.markdown(f"### Category {cid_disp}")
+        st.caption(title_name)
+        st.markdown("---")
+
+        st.markdown("**Metrics details**")
+        if data is None:
+            st.caption("Нет данных Current Year для этой категории.")
+        else:
+            _b, _a = data.get("before") or {}, data.get("after") or {}
+            st.dataframe(
+                _bulk_metrics_primary_detail_df(_b, _a),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("**Additional metrics**")
+        if data is None:
+            st.caption("—")
+        else:
+            _b, _a = data.get("before") or {}, data.get("after") or {}
+            st.dataframe(
+                _bulk_metrics_additional_detail_df(_b, _a),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("**Decision details**")
+        def _show(k):
+            v = row.get(k)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return "—"
+            s = str(v).strip()
+            return s if s else "—"
+
+        st.markdown(
+            f"- **decision_code:** {_show('decision_code')}\n"
+            f"- **next_step:** {_show('next_step')}\n"
+            f"- **warning_flags:** {_show('warning_flags')}"
+        )
+
+
+def _bulk_expander_title_for_row(row: pd.Series) -> str:
+    try:
+        cid_s = format_integer(int(row["category_id"]), group_thousands=True)
+    except (TypeError, ValueError):
+        cid_s = str(row.get("category_id", "—"))
+    nm = str(row.get("category_name") or "")
+    if len(nm) > 52:
+        nm = nm[:49] + "…"
+    pr = str(row.get("priority") or "—")
+    return f"{cid_s} · {nm} · {pr}"
+
+
+def _matrix_format_result_display(raw: str) -> str:
+    """Excel-style labels for matrix Result column (↑ / ↓ / =). Display-only."""
+    dash = "—"
+    if raw == "":
+        return ""
+    if raw == dash:
+        return dash
+    prefix = ""
+    body = raw.strip()
+    if body.startswith("O: "):
+        prefix = "O: "
+        body = body[3:].strip()
+    mapped = {
+        "Growth": "↑ Growth",
+        "Stable": "= Stable",
+        "Decrease": "↓ Decrease",
+    }.get(body)
+    if mapped is None:
+        return raw
+    return prefix + mapped
+
+
+def _matrix_result_semantic_css(val) -> str:
+    """Dashboard pill for Result cells — Growth / Stable / Decrease (display-only, high contrast)."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    dash = "—"
+    if not s or s == dash:
+        return ""
+    low = s.lower()
+    base = (
+        "border-radius: 9999px; padding: 4px 12px; font-weight: 700; font-size: 0.88rem; "
+        "display: inline-block; min-width: 8em; text-align: center; letter-spacing: 0.01em;"
+    )
+    if "decrease" in low:
+        return (
+            base
+            + "background: #fee2e2; color: #991b1b; border: 1px solid #f87171;"
+        )
+    if "growth" in low:
+        return (
+            base
+            + "background: #dcfce7; color: #166534; border: 1px solid #4ade80;"
+        )
+    if "stable" in low:
+        return (
+            base
+            + "background: #fef9c3; color: #854d0e; border: 1px solid #facc15;"
+        )
+    return ""
+
+
 def _matrix_classify_label(pct_diff, geo: str, metric_key: str):
     if pct_diff is None:
         return "—"
@@ -2716,6 +4048,111 @@ def _matrix_classify_label(pct_diff, geo: str, metric_key: str):
         decline_threshold=th["decline"],
     )
     return decode_status(code)
+
+
+def _results_compute_y2y_npl_sp_cr_bundle(
+    geo: str,
+    paid_users_before,
+    paid_users_after,
+    spending_before,
+    spending_after,
+    active_before,
+    active_after,
+    py_paid_users_before,
+    py_paid_users_after,
+    py_spending_before,
+    py_spending_after,
+    py_ac_before,
+    py_ac_after,
+):
+    """
+    Y2Y deltas for Paid users (NPL %), Spending %, CR % — same construction as PPV matrix diff Y2Y rows.
+    Used to align Results with matrix when matrix_result_focus == \"diff_y2y\".
+    """
+    cy_cr_b = _matrix_safe_div(paid_users_before, active_before)
+    cy_cr_a = _matrix_safe_div(paid_users_after, active_after)
+    py_cr_b = _matrix_safe_div(py_paid_users_before, py_ac_before)
+    py_cr_a = _matrix_safe_div(py_paid_users_after, py_ac_after)
+
+    cy_npl_d = _matrix_pct_diff(paid_users_before, paid_users_after)
+    py_npl_d = _matrix_pct_diff(py_paid_users_before, py_paid_users_after)
+    cy_sp_d = _matrix_pct_diff(spending_before, spending_after)
+    py_sp_d = _matrix_pct_diff(py_spending_before, py_spending_after)
+    cy_cr_d = _matrix_pct_diff(cy_cr_b, cy_cr_a)
+    py_cr_d = _matrix_pct_diff(py_cr_b, py_cr_a)
+
+    y2y_npl = (
+        (cy_npl_d - py_npl_d)
+        if cy_npl_d is not None and py_npl_d is not None
+        else None
+    )
+    y2y_sp = (
+        (cy_sp_d - py_sp_d) if cy_sp_d is not None and py_sp_d is not None else None
+    )
+    y2y_cr = (
+        (cy_cr_d - py_cr_d) if cy_cr_d is not None and py_cr_d is not None else None
+    )
+
+    th = _matrix_geo_thresholds(geo)
+    npl_code = (
+        classify_change(
+            y2y_npl,
+            growth_threshold=th["npl"]["growth"],
+            decline_threshold=th["npl"]["decline"],
+        )
+        if y2y_npl is not None
+        else None
+    )
+    sp_code = (
+        classify_change(
+            y2y_sp,
+            growth_threshold=th["sp"]["growth"],
+            decline_threshold=th["sp"]["decline"],
+        )
+        if y2y_sp is not None
+        else None
+    )
+    cr_code = (
+        classify_change(
+            y2y_cr,
+            growth_threshold=th["cr"]["growth"],
+            decline_threshold=th["cr"]["decline"],
+        )
+        if y2y_cr is not None
+        else None
+    )
+
+    complete = npl_code is not None and sp_code is not None and cr_code is not None
+    decision_code = f"{npl_code}{sp_code}{cr_code}" if complete else None
+
+    return {
+        "complete": complete,
+        "y2y_npl": y2y_npl,
+        "y2y_sp": y2y_sp,
+        "y2y_cr": y2y_cr,
+        "npl_code": npl_code,
+        "sp_code": sp_code,
+        "cr_code": cr_code,
+        "decision_code": decision_code,
+    }
+
+
+def _results_render_metric_detail_row(
+    title: str, pct, code: str | None, other_o_prefix: bool
+):
+    if pct is None or code is None:
+        st.warning(f"{title}: —")
+        return
+    lbl = decode_status(code)
+    if other_o_prefix:
+        lbl = f"O: {lbl}"
+    row = f"{title}: {pct:.2f}% → {lbl} ({code})"
+    if code == "G":
+        st.success(row)
+    elif code == "D":
+        st.error(row)
+    else:
+        st.warning(row)
 
 
 def _build_ppv_matrix_rows(
@@ -2734,6 +4171,8 @@ def _build_ppv_matrix_rows(
     py_ac_a,
     omit_previous_year: bool = False,
     omit_y2y_only: bool = False,
+    is_other_category_scenario: bool = False,
+    matrix_result_focus: str = "diff_y2y",
 ):
     """Returns list of flat dicts for display (Paid users, Spending, CR, Active)."""
     cy_cr_b = _matrix_safe_div(cy_paid_users_b, cy_ac_b)
@@ -2789,7 +4228,34 @@ def _build_ppv_matrix_rows(
             py_before = format_matrix_metric(pbb, as_int=as_int and pbb is not None)
             py_after = format_matrix_metric(pba, as_int=as_int and pba is not None)
             py_diff_s = format_percent(py_d)
-        res_cy = _matrix_classify_label(cy_d, geo, th_key)
+
+        # Single Result column: show classification only on the primary row for this scenario
+        # (diff Y2Y for Regular / Low NPL / Other category; Current Year for New category /
+        # Previous Year anomaly). Other category adds O: prefix on diff Y2Y only.
+        focus_y2y = matrix_result_focus == "diff_y2y"
+        focus_cy = matrix_result_focus == "current_year"
+
+        if focus_cy:
+            res_cy = _matrix_classify_label(cy_d, geo, th_key)
+            res_y2y = dash
+        elif focus_y2y:
+            res_cy = ""
+            if omit_previous_year or omit_y2y_only:
+                res_y2y = dash
+            else:
+                base_y2y = _matrix_classify_label(y2y, geo, th_key)
+                if base_y2y == dash:
+                    res_y2y = dash
+                elif is_other_category_scenario:
+                    res_y2y = f"O: {base_y2y}"
+                else:
+                    res_y2y = base_y2y
+        else:
+            res_cy = ""
+            res_y2y = dash
+
+        res_cy = _matrix_format_result_display(res_cy)
+        res_y2y = _matrix_format_result_display(res_y2y)
 
         rows_out.append(
             {
@@ -2818,10 +4284,69 @@ def _build_ppv_matrix_rows(
                 "Before": "",
                 "After": "",
                 "Diff %": dash if omit_previous_year else y2y_diff_cell,
-                "Result": "",
+                "Result": res_y2y,
             }
         )
     return rows_out
+
+
+def _ppv_matrix_primary_period_label(matrix_result_focus: str) -> str:
+    return "diff Y2Y" if matrix_result_focus == "diff_y2y" else "Current Year"
+
+
+def _ppv_matrix_style_analytics(df: pd.DataFrame, matrix_result_focus: str):
+    """
+    Primary-period rows: stronger accent + band; metric groups separated by top rule.
+    Result cells: pill semantic styling.
+    """
+    primary_period = _ppv_matrix_primary_period_label(matrix_result_focus)
+    primary_band = "background-color: rgba(59,130,246,0.16)"
+    primary_accent = (
+        "border-left: 9px solid #60a5fa; "
+        "box-shadow: inset 6px 0 0 rgba(59,130,246,0.12), inset 0 0 0 1px rgba(59,130,246,0.14)"
+    )
+    grp_rule = "border-top: 3px solid rgba(148,163,184,0.35)"
+    metrics_col = df["Metric"].tolist()
+    n = len(metrics_col)
+
+    def _row_styles(row):
+        styles = []
+        try:
+            ri = int(row.name)
+        except (TypeError, ValueError):
+            ri = metrics_col.index(row["Metric"]) if row["Metric"] in metrics_col else 0
+        group_start = ri > 0 and metrics_col[ri] != metrics_col[ri - 1]
+        primary = row["Period"] == primary_period
+        for col in df.columns:
+            parts = []
+            if group_start:
+                parts.append(grp_rule)
+            if primary:
+                parts.append(primary_accent)
+                parts.append("font-weight: 650")
+            if col == "Result":
+                sem = _matrix_result_semantic_css(row[col])
+                if sem:
+                    parts.append(sem)
+                elif primary:
+                    parts.append(primary_band)
+            elif primary:
+                parts.append(primary_band)
+            styles.append("; ".join(parts) + ";" if parts else "")
+        return styles
+
+    return df.style.apply(_row_styles, axis=1)
+
+
+def _ppv_matrix_add_primary_fallback_column(df: pd.DataFrame, matrix_result_focus: str):
+    primary_period = _ppv_matrix_primary_period_label(matrix_result_focus)
+    out = df.copy()
+    out.insert(
+        0,
+        "Primary",
+        ["✓" if p == primary_period else "" for p in out["Period"]],
+    )
+    return out
 
 
 def _compute_potential_spendings_block(
@@ -2904,6 +4429,68 @@ def _potential_spendings_row_diff_abs(fact, could_be) -> float | None:
         return None
 
 
+def _potential_spendings_diff_pct_display(d: float | None) -> str:
+    """Display-only: ↑ / ↓ / = + %, aligned with PPV matrix semantic colors (no logic change)."""
+    dash = "—"
+    if d is None:
+        return dash
+    if abs(float(d)) < 1e-15:
+        return "= 0.00%"
+    body = f"{float(d):.2f}%"
+    if float(d) > 0:
+        return f"↑ {body}"
+    return f"↓ {body}"
+
+
+def _potential_spendings_diff_pct_cell_css(val) -> str:
+    """Semantic diff % coloring aligned with matrix Result pills (dashboard / dark‑friendly)."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).strip()
+    if not s or s == "—" or s.lower() == "not available":
+        return ""
+    if s.startswith("="):
+        return "background-color: rgba(234,179,8,0.18); color: #fef9c3; font-weight: 600; border-radius: 8px;"
+    if s.startswith("↑"):
+        return "background-color: rgba(34,197,94,0.16); color: #bbf7d0; font-weight: 600; border-radius: 8px;"
+    if s.startswith("↓"):
+        return "background-color: rgba(239,68,68,0.14); color: #fecaca; font-weight: 600; border-radius: 8px;"
+    return ""
+
+
+def _potential_spendings_style_table(df: pd.DataFrame):
+    try:
+        return df.style.map(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
+    except AttributeError:
+        return df.style.applymap(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
+
+
+def _potential_spendings_table_dataframe_kwargs() -> dict:
+    """Wider columns for the small Potential table (display only)."""
+    out: dict = {}
+    try:
+        sig = inspect.signature(st.dataframe).parameters
+        if "column_config" not in sig:
+            return out
+        out["column_config"] = {
+            "Potential Spendings": st.column_config.TextColumn(
+                "Potential Spendings",
+                width="medium",
+            ),
+            "Fact": st.column_config.TextColumn("Fact", width="large"),
+            "Could be": st.column_config.TextColumn("Could be", width="large"),
+            "diff": st.column_config.TextColumn("diff", width="medium"),
+            "diff %": st.column_config.TextColumn("diff %", width="large"),
+        }
+        if "hide_index" in sig:
+            out["hide_index"] = True
+        if "use_container_width" in sig:
+            out["use_container_width"] = True
+    except (TypeError, ValueError):
+        return {}
+    return out
+
+
 def _build_potential_spendings_table_df(
     _pot: dict,
     *,
@@ -2921,7 +4508,7 @@ def _build_potential_spendings_table_df(
         "Fact": format_potential_amount(fa),
         "Could be": format_potential_amount(ca),
         "diff": format_delta(a1, as_integer=False),
-        "diff %": format_percent(d1, zero_display="0") if d1 is not None else dash,
+        "diff %": _potential_spendings_diff_pct_display(d1),
     }
 
     if omit_py_dependent_row:
@@ -2940,173 +4527,316 @@ def _build_potential_spendings_table_df(
             "Fact": format_potential_amount(fs),
             "Could be": format_potential_amount(cs),
             "diff": format_delta(a2, as_integer=True),
-            "diff %": format_percent(d2, zero_display="0") if d2 is not None else dash,
+            "diff %": _potential_spendings_diff_pct_display(d2),
         }
 
     return pd.DataFrame([row_arppu, row_spend])
 
 
-if _category_bulk_mode:
-    with st.expander("Скрин с данными (OCR)", expanded=False):
-        st.info(
-            "OCR для ручного ввода доступен только в **single analysis** (одна категория). "
-            "В bulk-режиме используйте файлы и таблицу bulk."
+def _ppv_matrix_primary_hint_html(matrix_result_focus: str) -> str:
+    label = _ppv_matrix_primary_period_label(matrix_result_focus)
+    return (
+        '<div class="sd-dash-card" style="padding:8px 12px;margin-bottom:6px;">'
+        f'<strong>Primary comparison:</strong> '
+        f'<span style="opacity:0.9">{label}</span> — Result column shows classification for this period only.'
+        "</div>"
+    )
+
+
+def _ppv_matrix_dataframe_kwargs() -> dict:
+    """Pinned Metric + Period when Streamlit supports pinned on TextColumn."""
+    out: dict = {}
+    try:
+        sig = inspect.signature(st.dataframe).parameters
+        if "column_config" not in sig:
+            return out
+        tc_sig = inspect.signature(st.column_config.TextColumn).parameters
+        pin_kw: dict = {"pinned": "left"} if "pinned" in tc_sig else {}
+        out["column_config"] = {
+            "Metric": st.column_config.TextColumn("Metric", width="medium", **pin_kw),
+            "Period": st.column_config.TextColumn("Period", width="small", **pin_kw),
+            "Before": st.column_config.TextColumn("Before", width="small"),
+            "After": st.column_config.TextColumn("After", width="small"),
+            "Diff %": st.column_config.TextColumn("Diff %", width="small"),
+            "Result": st.column_config.TextColumn("Result", width="medium"),
+        }
+        if "hide_index" in sig:
+            out["hide_index"] = True
+        if "use_container_width" in sig:
+            out["use_container_width"] = True
+    except (TypeError, ValueError):
+        return {}
+    return out
+
+
+def _dataframe_tall_height_kw(n_rows: int) -> dict:
+    """Viewport height matched to row count (~no empty tail under PPV matrix)."""
+    kw: dict = {}
+    try:
+        sig = inspect.signature(st.dataframe).parameters
+        if "height" not in sig or not n_rows:
+            return kw
+        row_px = 36
+        chrome = 56
+        slack_rows = 1
+        h = chrome + (int(n_rows) + slack_rows) * row_px + 12
+        kw["height"] = min(1400, max(220, h))
+        if "row_height" in sig:
+            kw["row_height"] = row_px
+    except (TypeError, ValueError):
+        return {}
+    return kw
+
+
+def _metric_summary_dataframe_kw(n_rows: int) -> dict:
+    """Tight viewport: all data rows visible, +1 spare grid row — avoid large blank tail."""
+    kw: dict = {}
+    try:
+        sig = inspect.signature(st.dataframe).parameters
+        if "height" not in sig or n_rows <= 0:
+            return kw
+        row_px = 36
+        chrome = 56
+        slack_rows = 1
+        h = chrome + (int(n_rows) + slack_rows) * row_px + 12
+        kw["height"] = min(1200, max(260, h))
+        if "row_height" in sig:
+            kw["row_height"] = row_px
+    except (TypeError, ValueError):
+        return {}
+    return kw
+
+
+def _exec_arrow_for_code(code: str | None) -> str:
+    if code == "G":
+        return "↑"
+    if code == "D":
+        return "↓"
+    return "="
+
+
+def _compute_single_executive_kpis(
+    *,
+    geo: str,
+    matrix_result_focus_run: str,
+    result: dict,
+    y2y_bundle,
+    paid_users_before,
+    paid_users_after,
+    spending_before,
+    spending_after,
+    active_before,
+    active_after,
+    matrix_py_ac_before,
+    matrix_py_ac_after,
+) -> list[tuple[str, str | None, str | None]]:
+    """(label, formatted_pct_or_none, code G/S/D) for four core metrics."""
+    th = _matrix_geo_thresholds(geo or "default")["npl"]
+    out: list[tuple[str, str | None, str | None]] = []
+
+    def _fmt(v) -> str | None:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return f"{float(v):+.2f}%"
+
+    if matrix_result_focus_run == "current_year":
+        out.append(("Paid users", _fmt(result.get("npl_diff")), result.get("npl_code")))
+        out.append(("Spending", _fmt(result.get("sp_diff")), result.get("sp_code")))
+        out.append(("CR", _fmt(result.get("cr_diff")), result.get("cr_code")))
+        ad = result.get("active_diff")
+        ac_code = None
+        if ad is not None and not (isinstance(ad, float) and pd.isna(ad)):
+            ac_code = classify_change(float(ad), th["growth"], th["decline"])
+        out.append(("Active listers", _fmt(ad), ac_code))
+        return out
+
+    if y2y_bundle is not None and getattr(y2y_bundle, "__getitem__", None) and y2y_bundle.get("complete"):
+        out.append(
+            ("Paid users", _fmt(y2y_bundle.get("y2y_npl")), y2y_bundle.get("npl_code"))
         )
-else:
-    with st.expander("Скрин с данными (OCR) — single analysis", expanded=False):
-        st.caption(
-            "**Current Year** screenshot → поля **Current Year input** (manual override). "
-            "**Previous Year** screenshot → только блок **Previous Year** (матрица, Y2Y, Potential); "
-            "строка Previous Year в матрице **не** заполняется из OCR Current Year. "
-            "**category_id** для OCR не используется — только совпадение по **названию метрики**."
+        out.append(("Spending", _fmt(y2y_bundle.get("y2y_sp")), y2y_bundle.get("sp_code")))
+        out.append(("CR", _fmt(y2y_bundle.get("y2y_cr")), y2y_bundle.get("cr_code")))
+        cy_a = _matrix_pct_diff(active_before, active_after)
+        py_a = _matrix_pct_diff(matrix_py_ac_before, matrix_py_ac_after)
+        ay = (
+            (cy_a - py_a)
+            if cy_a is not None and py_a is not None
+            else None
         )
-        st.caption(
-            "Нативной вставки изображения из буфера (Ctrl+V) в Streamlit **без** отдельного "
-            "JS-компонента или доп. пакетов нет: используйте **загрузку файла** или вставьте "
-            "**data URL** / **base64** в поле ниже (можно получить из DevTools / внешнего конвертера)."
+        acode = (
+            classify_change(ay, th["growth"], th["decline"])
+            if ay is not None
+            else None
         )
-        tab_ocr_cy, tab_ocr_py = st.tabs(
-            ["Current Year screenshot", "Previous Year screenshot"]
+        out.append(("Active listers", _fmt(ay), acode))
+        return out
+
+    return [(n, None, None) for n in ("Paid users", "Spending", "CR", "Active listers")]
+
+
+def _render_single_executive_summary(kpis: list[tuple[str, str | None, str | None]], disp_fd: str) -> None:
+    """Compact KPI strip mirrored to primary-period metrics."""
+
+    def _esc(s: str) -> str:
+        return (
+            str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
         )
 
-        with tab_ocr_cy:
-            up_cy = st.file_uploader(
-                "Файл скриншота (PNG/JPG/JPEG)",
-                type=["png", "jpg", "jpeg"],
-                key="ocr_cy_file_uploader",
-            )
-            paste_cy = st.text_area(
-                "Или вставьте data:image/...;base64,... либо сырой base64",
-                height=72,
-                key="ocr_cy_paste_b64",
-                placeholder="data:image/png;base64,iVBORw0KGgo...",
-            )
-            img_cy, dec_err_cy = _decode_optional_image_bytes(up_cy, paste_cy)
-            if dec_err_cy:
-                st.warning(dec_err_cy)
-            else:
-                _preview_cy = img_cy if img_cy is not None else (
-                    up_cy.getvalue() if up_cy is not None else None
+    hb = ""
+    for label, pct_s, code in kpis:
+        if pct_s is None:
+            val = "<span style='opacity:0.75'>—</span>"
+            sub = ""
+        else:
+            arr = _exec_arrow_for_code(code)
+            deco = decode_status(code) if code else ""
+            val = f"{arr} {_esc(pct_s)}"
+            sub = f'<div class="sd-mini-kpi-sub">{_esc(deco)}</div>' if deco else ""
+        hb += (
+            f'<div class="sd-mini-kpi"><div class="sd-mini-kpi-label">{_esc(label)}</div>'
+            f'<div class="sd-mini-kpi-val">{val}</div>{sub}</div>'
+        )
+
+    oc = (
+        '<div class="sd-mini-kpi" style="flex:2 1 220px;background:rgba(148,163,184,0.12);">'
+        '<div class="sd-mini-kpi-label">Final decision</div>'
+        f'<div class="sd-mini-kpi-val" style="font-size:1.15rem;">{_esc(disp_fd)}</div></div>'
+    )
+
+    st.markdown(
+        '<p class="sd-h2" style="margin-top:0.35rem">Executive summary</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="sd-mini-kpis">{hb}{oc}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_potential_spendings_kpi_cards(pot_df: pd.DataFrame) -> None:
+    """Single analysis: KPI blocks inside one bordered panel (Fact, Could be, Diff %)."""
+    if pot_df is None or pot_df.empty:
+        return
+    rows = list(pot_df.iterrows())
+    with st.container(border=True):
+        for i, (_, row) in enumerate(rows):
+            st.markdown(f"**{row.get('Potential Spendings', '—')}**")
+            fc1, fc2, fc3 = st.columns(3, gap="small")
+            with fc1:
+                st.caption("Fact")
+                st.markdown(f"**{row.get('Fact', '—')}**")
+            with fc2:
+                st.caption("Could be")
+                st.markdown(f"**{row.get('Could be', '—')}**")
+            with fc3:
+                st.caption("Diff %")
+                pct = row.get("diff %", "—")
+                st.markdown(
+                    _potential_spendings_diff_pct_badge_md(pct),
+                    unsafe_allow_html=True,
                 )
-                if _preview_cy:
-                    _ocr_render_screenshot_preview(_preview_cy, label="Current Year")
+            if i < len(rows) - 1:
+                st.markdown("")
 
-            if st.button("Распознать и применить к Current Year input", key="ocr_cy_apply_btn"):
-                img_b, err_b = _decode_optional_image_bytes(up_cy, paste_cy)
-                if err_b:
-                    st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
-                        None, err_b, {}, [], []
-                    )
-                    st.session_state["_cy_ocr_override"] = True
-                    st.rerun()
-                elif not img_b:
-                    st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
-                        None,
-                        "Нет изображения: загрузите файл или вставьте data URL / base64.",
-                        {},
-                        [],
-                        [],
-                    )
-                    st.session_state["_cy_ocr_override"] = True
-                    st.rerun()
-                else:
-                    variants, ocr_error = _ocr_collect_tesseract_variants(img_b)
-                    if ocr_error:
-                        st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
-                            None, ocr_error, {}, [], []
-                        )
-                    else:
-                        parsed = _merge_cy_parsed_from_ocr_variants(variants)
-                        ocr_text = _ocr_pick_preview_text_cy(variants)
-                        # Matrix "Previous Year" row: only matrix_py_* (PY files / PY OCR). Do not mirror
-                        # CY OCR into matrix_py_* — that duplicated both rows and could overwrite PY OCR.
-                        applied_labels, dbg_rows = _apply_cy_ocr_parsed_to_session(
-                            st.session_state,
-                            parsed,
-                            mirror_matrix_py=False,
-                        )
-                        st.session_state["_ocr_cy_feedback"] = _build_cy_ocr_feedback(
-                            ocr_text, None, parsed, applied_labels, dbg_rows
-                        )
-                    st.session_state["_cy_ocr_override"] = True
-                    st.rerun()
 
-            _render_ocr_feedback_messages(st.session_state.get("_ocr_cy_feedback"))
-            _render_ocr_debug_expanders(st.session_state.get("_ocr_cy_feedback"), "cy")
+def _potential_spendings_diff_pct_badge_md(pct) -> str:
+    s = "—" if pct is None else str(pct)
+    css = _potential_spendings_diff_pct_cell_css(s)
+    if not css:
+        return f"<span>{s}</span>"
+    esc = (
+        str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return f'<span style="{css}; padding: 4px 10px;">{esc}</span>'
 
-        with tab_ocr_py:
-            up_py = st.file_uploader(
-                "Файл скриншота (PNG/JPG/JPEG)",
-                type=["png", "jpg", "jpeg"],
-                key="ocr_py_file_uploader",
-            )
-            paste_py = st.text_area(
-                "Или вставьте data:image/...;base64,... либо сырой base64",
-                height=72,
-                key="ocr_py_paste_b64",
-                placeholder="data:image/png;base64,iVBORw0KGgo...",
-            )
-            img_py, dec_err_py = _decode_optional_image_bytes(up_py, paste_py)
-            if dec_err_py:
-                st.warning(dec_err_py)
-            else:
-                _preview_py = img_py if img_py is not None else (
-                    up_py.getvalue() if up_py is not None else None
-                )
-                if _preview_py:
-                    _ocr_render_screenshot_preview(_preview_py, label="Previous Year")
 
-            if st.button(
-                "Распознать и применить к Previous Year (матрица)",
-                key="ocr_py_apply_btn",
-            ):
-                img_b, err_b = _decode_optional_image_bytes(up_py, paste_py)
-                if err_b:
-                    st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
-                        None, err_b, {}, [], []
-                    )
-                    st.session_state["_py_ocr_override"] = True
-                    st.rerun()
-                elif not img_b:
-                    st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
-                        None,
-                        "Нет изображения: загрузите файл или вставьте data URL / base64.",
-                        {},
-                        [],
-                        [],
-                    )
-                    st.session_state["_py_ocr_override"] = True
-                    st.rerun()
-                else:
-                    variants, ocr_error = _ocr_collect_tesseract_variants(img_b)
-                    if ocr_error:
-                        st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
-                            None, ocr_error, {}, [], []
-                        )
-                    else:
-                        parsed = _merge_py_parsed_from_ocr_variants(variants)
-                        ocr_text = _ocr_pick_preview_text_py(variants)
-                        applied_labels, dbg_rows = _apply_py_ocr_parsed_to_session(
-                            st.session_state, parsed
-                        )
-                        st.session_state["_ocr_py_feedback"] = _build_py_ocr_feedback(
-                            ocr_text, None, parsed, applied_labels, dbg_rows
-                        )
-                    st.session_state["_py_ocr_override"] = True
-                    st.rerun()
+def _single_next_step_lead_icon(ns: str | None) -> tuple[str, str]:
+    """(emoji, short label) for recommendation header — heuristic only."""
+    if not ns:
+        return "💡", "Recommendation"
+    s = str(ns).lower()
+    if "rollback" in s or "roll back" in s or "return prices" in s:
+        return "↩️", "Rollback suggested"
+    if "keep" in s:
+        return "✅", "Keep / maintain"
+    if "re-increase" in s or "raise price" in s or "raise prices" in s:
+        return "📈", "Price increase option"
+    if "monitor" in s or "watch" in s:
+        return "👀", "Monitor"
+    if "teamlead" in s:
+        return "👥", "Review with leadership"
+    if "experiment" in s or "search" in s:
+        return "🔍", "Further investigation"
+    return "💡", "Recommended actions"
 
-            _render_ocr_feedback_messages(st.session_state.get("_ocr_py_feedback"))
-            _render_ocr_debug_expanders(st.session_state.get("_ocr_py_feedback"), "py")
+
+def _render_single_outcome_hero_and_actions(
+    disp_dc: str,
+    disp_fd: str,
+    disp_ns: str,
+) -> None:
+    st.markdown('<p class="sd-h2">Decision</p>', unsafe_allow_html=True)
+
+    def _esc(s: str) -> str:
+        return (
+            str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    if disp_fd == "Positive impact":
+        hcls = "sd-hero-wrap sd-hero-positive"
+    elif disp_fd == "Negative impact":
+        hcls = "sd-hero-wrap sd-hero-negative"
+    elif disp_fd == "No impact":
+        hcls = "sd-hero-wrap sd-hero-neutral"
+    else:
+        hcls = "sd-hero-wrap sd-hero-muted"
+
+    st.markdown(
+        f'<div class="{hcls}">'
+        f'<div class="sd-hero-title">Outcome</div>'
+        f'<div class="sd-hero-decision">{_esc(disp_fd)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Decision code encodes Paid users × Spending × CR trend (Growth / Stable / Decrease per metric)."
+    )
+    dc_clean = _esc(str(disp_dc))
+    st.markdown(
+        f'<span class="sd-code-pill" title="G Growth · S Stable · D Decrease">{dc_clean}</span>',
+        unsafe_allow_html=True,
+    )
+    with st.expander("Legend: G · S · D", expanded=False):
+        st.markdown(
+            "- **G** — Growth (above geo growth threshold)\n"
+            "- **S** — Stable (between decline and growth thresholds)\n"
+            "- **D** — Decrease (below decline threshold)"
+        )
+
+    emoji, ttl = _single_next_step_lead_icon(disp_ns)
+    ns_html = _esc(str(disp_ns)).replace("\n", "<br/>")
+    st.markdown(
+        f'<div class="sd-next-card">'
+        f'<div style="font-weight:600;margin-bottom:8px;font-size:1rem;">{emoji} {_esc(ttl)}</div>'
+        f"<p>{ns_html}</p></div>",
+        unsafe_allow_html=True,
+    )
+
 
 st.divider()
 
+st.markdown('<p class="sd-h2 sd-h2-tight">Ручной ввод данных</p>', unsafe_allow_html=True)
+
 _cy_ba: dict[str, tuple[float, float]] = {}
-with st.expander(
-    "🧮 Current Year input (manual override)",
-    expanded=not bool(merged_data),
-):
-    _cy_pad_l, _cy_main, _cy_pad_r = st.columns([1, 6, 1])
-    with _cy_main:
+with st.expander("Ручной ввод данных · Current Year + Previous Year (матрица)", expanded=not bool(merged_data)):
+    _manuel_cy, _manuel_py = st.columns([1.08, 0.94], gap="small")
+    with _manuel_cy:
         with st.container(border=True):
             st.subheader("Current Year input")
             st.caption(
@@ -3123,7 +4853,6 @@ with st.expander(
             with _cy_h2:
                 st.markdown("**After**")
 
-            # Return values are the source of truth this run (session_state can lag behind widgets).
             for _dk, _dlabel, _dtyp in _CY_INPUT_METRICS:
                 sk = _cy_sess_key(_dk)
                 _cr0, _cr1, _cr2 = st.columns([1.55, 1, 1])
@@ -3160,6 +4889,39 @@ with st.expander(
                             label_visibility="collapsed",
                         )
                 _cy_ba[_dk] = (float(_bv), float(_av))
+
+    with _manuel_py:
+        with st.container(border=True):
+            st.subheader("Previous Year")
+            if _scenario_is_new_category(scenario):
+                st.caption(
+                    "New category: Previous Year и Y2Y недоступны."
+                )
+            st.caption(
+                "Значения для **матрицы**, **Y2Y** и **Potential Spending**. "
+                "После загрузки PY файлов и merge — автозаполнение; иначе вручную или OCR (**Previous Year**)."
+            )
+            st.markdown("**Paid users**")
+            matrix_py_paid_users_before = st.number_input(
+                "PY Paid users Before", min_value=0, key="matrix_py_paid_users_before"
+            )
+            matrix_py_paid_users_after = st.number_input(
+                "PY Paid users After", min_value=0, key="matrix_py_paid_users_after"
+            )
+            st.markdown("**Spending**")
+            matrix_py_spending_before = st.number_input(
+                "PY Spending Before", min_value=0.0, key="matrix_py_spending_before"
+            )
+            matrix_py_spending_after = st.number_input(
+                "PY Spending After", min_value=0.0, key="matrix_py_spending_after"
+            )
+            st.markdown("**Active listers**")
+            matrix_py_ac_before = st.number_input(
+                "PY Active Before", min_value=0, key="matrix_py_ac_before"
+            )
+            matrix_py_ac_after = st.number_input(
+                "PY Active After", min_value=0, key="matrix_py_ac_after"
+            )
 
 _ss = st.session_state
 if _cy_ba:
@@ -3233,123 +4995,232 @@ for _dk, _dlabel, _dtyp in _CY_INPUT_METRICS:
     )
 
 _df_cy = pd.DataFrame(_cy_tbl)
-_df_cy = _df_cy.rename(columns={"beforeDiff": "До %", "afterDiff": "После %"})
-_pct_cols = ["До %", "После %"]
-for _pc in _pct_cols:
-    _df_cy[_pc] = pd.to_numeric(_df_cy[_pc], errors="coerce")
+# Display layer: same underlying _cy_tbl calculations; hide empty «До %» (baseline) column.
+_df_cy_display = pd.DataFrame(
+    {
+        "Metric": _df_cy["Metric"],
+        "Before": _df_cy["До"],
+        "After": _df_cy["После"],
+        "Diff %": pd.to_numeric(_df_cy["afterDiff"], errors="coerce"),
+    }
+)
 
-_sty_cy = _df_cy.style
+_sty_cy = _df_cy_display.style
 try:
-    _sty_cy = _sty_cy.map(_cy_diff_semantic_style, subset=_pct_cols)
+    _sty_cy = _sty_cy.map(_metric_summary_diff_pct_style, subset=["Diff %"])
 except AttributeError:
-    _sty_cy = _sty_cy.applymap(_cy_diff_semantic_style, subset=_pct_cols)
-_sty_cy = _sty_cy.format(format_summary_percent_cell, subset=_pct_cols)
+    _sty_cy = _sty_cy.applymap(_metric_summary_diff_pct_style, subset=["Diff %"])
+_sty_cy = _sty_cy.format(format_summary_percent_cell, subset=["Diff %"])
+
+st.caption(
+    "**Периоды и Release** — компактная строка (справочно). Расчёт не затрагивают."
+)
+_per_rel, _per_cy, _per_py = st.columns([0.78, 1.08, 1.08], gap="small")
+with _per_rel:
+    st.markdown("**Release**")
+    st.date_input(
+        "Release date",
+        value=date.today(),
+        key="release_date",
+    )
+with _per_cy:
+    st.markdown("**Current Year**")
+    _pc_top = st.columns(4)
+    with _pc_top[0]:
+        st.date_input("CY Before from", value=date.today(), key="cy_before_from")
+    with _pc_top[1]:
+        st.date_input("CY Before to", value=date.today(), key="cy_before_to")
+    with _pc_top[2]:
+        st.date_input("CY After from", value=date.today(), key="cy_after_from")
+    with _pc_top[3]:
+        st.date_input("CY After to", value=date.today(), key="cy_after_to")
+with _per_py:
+    st.markdown("**Previous Year**")
+    _pp_top = st.columns(4)
+    with _pp_top[0]:
+        st.date_input("PY Before from", value=date.today(), key="py_before_from")
+    with _pp_top[1]:
+        st.date_input("PY Before to", value=date.today(), key="py_before_to")
+    with _pp_top[2]:
+        st.date_input("PY After from", value=date.today(), key="py_after_from")
+    with _pp_top[3]:
+        st.date_input("PY After to", value=date.today(), key="py_after_to")
 
 st.divider()
 
-with st.container(border=True):
-    st.markdown("##### Сводка по метрикам")
-    st.caption("В одной строке: абсолютные **До** / **После** и относительные **До %** / **После %**.")
-    st.dataframe(_sty_cy, use_container_width=True, hide_index=True)
-
-with st.expander("Previous Year (для матрицы, Y2Y и Potential Spending)", expanded=False):
-    if _scenario_is_new_category(scenario):
-        st.caption(
-            "New category: Previous Year and Y2Y are not available."
-        )
-    st.caption(
-        "Если загружены Previous Year файлы и найден Category ID — значения подставятся автоматически. "
-        "Иначе введите вручную или используйте OCR вкладки **Previous Year**. "
-        "Строка Previous Year в матрице берётся только отсюда или из файлов PY (не из OCR Current Year)."
+if _category_single_mode:
+    st.markdown(
+        '<p class="sd-h2 sd-h2-tight">Analytics</p>',
+        unsafe_allow_html=True,
     )
-    py_l, py_r = st.columns(2)
-    with py_l:
-        st.markdown("**Paid users**")
-        matrix_py_paid_users_before = st.number_input(
-            "PY Paid users Before", min_value=0, key="matrix_py_paid_users_before"
-        )
-        matrix_py_paid_users_after = st.number_input(
-            "PY Paid users After", min_value=0, key="matrix_py_paid_users_after"
-        )
-        st.markdown("**Spending**")
-        matrix_py_spending_before = st.number_input(
-            "PY Spending Before", min_value=0.0, key="matrix_py_spending_before"
-        )
-        matrix_py_spending_after = st.number_input(
-            "PY Spending After", min_value=0.0, key="matrix_py_spending_after"
-        )
-    with py_r:
-        st.markdown("**Active listers**")
-        matrix_py_ac_before = st.number_input("PY Active Before", min_value=0, key="matrix_py_ac_before")
-        matrix_py_ac_after = st.number_input("PY Active After", min_value=0, key="matrix_py_ac_after")
 
-with st.container(border=True):
-    st.subheader("PPV matrix (analytics)")
-    st.caption("Только отображение; не влияет на решение по кнопке Calculate.")
-    _nc_sc = _scenario_is_new_category(scenario)
-    _py_anom_sc = _scenario_is_py_anomaly(scenario)
-    mq_left, mq_right = st.columns([1.55, 1.0])
-    with mq_left:
-        if _py_anom_sc:
-            st.caption(
-                "Previous Year anomaly: PY data is shown for reference, but Y2Y and "
-                "PY-dependent Potential Spendings are excluded."
-            )
-        _matrix_df = pd.DataFrame(
-            _build_ppv_matrix_rows(
-                geo,
-                paid_users_before,
-                paid_users_after,
-                spending_before,
-                spending_after,
-                active_before,
-                active_after,
-                matrix_py_paid_users_before,
-                matrix_py_paid_users_after,
-                matrix_py_spending_before,
-                matrix_py_spending_after,
-                matrix_py_ac_before,
-                matrix_py_ac_after,
-                omit_previous_year=_nc_sc,
-                omit_y2y_only=_py_anom_sc and not _nc_sc,
-            )
+_nc_sc = _scenario_is_new_category(scenario)
+_py_anom_sc = _scenario_is_py_anomaly(scenario)
+_matrix_result_focus = "current_year" if (_nc_sc or _py_anom_sc) else "diff_y2y"
+_matrix_df = pd.DataFrame(
+    _build_ppv_matrix_rows(
+        geo,
+        paid_users_before,
+        paid_users_after,
+        spending_before,
+        spending_after,
+        active_before,
+        active_after,
+        matrix_py_paid_users_before,
+        matrix_py_paid_users_after,
+        matrix_py_spending_before,
+        matrix_py_spending_after,
+        matrix_py_ac_before,
+        matrix_py_ac_after,
+        omit_previous_year=_nc_sc,
+        omit_y2y_only=_py_anom_sc and not _nc_sc,
+        is_other_category_scenario=_scenario_is_other_category(scenario),
+        matrix_result_focus=_matrix_result_focus,
+    )
+)
+_pot = _compute_potential_spendings_block(
+    paid_users_before,
+    paid_users_after,
+    spending_before,
+    spending_after,
+    active_before,
+    active_after,
+    matrix_py_paid_users_before,
+    matrix_py_paid_users_after,
+    matrix_py_ac_before,
+    matrix_py_ac_after,
+    omit_py=_nc_sc or _py_anom_sc,
+)
+_pot_df = _build_potential_spendings_table_df(
+    _pot,
+    omit_py_dependent_row=_nc_sc or _py_anom_sc,
+)
+
+_matrix_h_kw = _dataframe_tall_height_kw(len(_matrix_df))
+
+
+def _render_analytics_potential_block(*, show_heading: bool = True) -> None:
+    if show_heading:
+        st.markdown("##### Potential Spendings")
+    if _nc_sc:
+        st.caption(
+            "New category: PY-dependent Potential Spendings excluded."
         )
-        st.dataframe(_matrix_df, hide_index=True, use_container_width=True)
+    elif _py_anom_sc:
+        st.caption(
+            "PY anomaly: Spendings row excluded; Could be / diff / diff % —."
+        )
+    elif _category_single_mode:
+        st.caption(
+            "Сравнение **Fact** vs **Could be** (только отображение)."
+        )
+    else:
+        st.caption("Fact vs **Could be** (display only).")
+
+    if _category_single_mode:
+        _render_potential_spendings_kpi_cards(_pot_df)
+    else:
+        _pkw = _potential_spendings_table_dataframe_kwargs()
+        try:
+            st.dataframe(
+                _potential_spendings_style_table(_pot_df),
+                **_pkw,
+            )
+        except TypeError:
+            st.dataframe(
+                _potential_spendings_style_table(_pot_df),
+                hide_index=True,
+                use_container_width=True,
+            )
+        except Exception:
+            try:
+                st.dataframe(_pot_df, **_pkw)
+            except TypeError:
+                st.dataframe(_pot_df, hide_index=True, use_container_width=True)
+
+
+with st.container(border=bool(_category_single_mode)):
+    st.markdown("##### Metric summary")
+    st.caption(
+        "Абсолютные **Before** / **After** и **Diff %** = (After − Before) / Before."
+    )
+    _ms_df_kw = _metric_summary_dataframe_kw(len(_df_cy_display))
+    try:
+        st.dataframe(_sty_cy, use_container_width=True, hide_index=True, **_ms_df_kw)
+    except TypeError:
+        st.dataframe(_sty_cy, use_container_width=True, hide_index=True)
+
+if _category_single_mode:
+    st.markdown(_ppv_matrix_primary_hint_html(_matrix_result_focus), unsafe_allow_html=True)
+    mtx_col, pot_col = st.columns(
+        [2.85, 1.35], gap="medium", vertical_alignment="top"
+    )
+    with mtx_col:
+        st.markdown("##### PPV matrix")
+        _ppv_cap = (
+            "Только отображение (не влияет на Calculate). "
+            "**Result** — для **primary comparison**. "
+        )
+        if _py_anom_sc:
+            _ppv_cap += (
+                "PY anomaly: Y2Y и PY-зависимый Potential — исключены."
+            )
+        st.caption(_ppv_cap)
+        try:
+            _matrix_styled = _ppv_matrix_style_analytics(_matrix_df, _matrix_result_focus)
+            _mkw = {**_ppv_matrix_dataframe_kwargs(), **_matrix_h_kw}
+            try:
+                st.dataframe(_matrix_styled, **_mkw)
+            except TypeError:
+                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True, **_matrix_h_kw)
+        except Exception:
+            st.dataframe(
+                _ppv_matrix_add_primary_fallback_column(
+                    _matrix_df, _matrix_result_focus
+                ),
+                hide_index=True,
+                use_container_width=True,
+                **_matrix_h_kw,
+            )
+    with pot_col:
+        st.markdown("##### Potential Spendings")
+        _render_analytics_potential_block(show_heading=False)
+else:
+    mq_left, mq_right = st.columns(
+        [2.85, 1.35], gap="medium", vertical_alignment="top"
+    )
+    with mq_left:
+        st.markdown("##### PPV matrix (analytics)")
+        _ppv_cap_b = (
+            "Display only (does not affect Calculate). "
+            "**Result** is for the primary comparison period. "
+        )
+        if _py_anom_sc:
+            _ppv_cap_b += (
+                "PY anomaly: Y2Y and PY-dependent Potential are excluded."
+            )
+        st.caption(_ppv_cap_b)
+        try:
+            _matrix_styled = _ppv_matrix_style_analytics(_matrix_df, _matrix_result_focus)
+            try:
+                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True, **_matrix_h_kw)
+            except TypeError:
+                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True)
+        except Exception:
+            st.dataframe(
+                _ppv_matrix_add_primary_fallback_column(
+                    _matrix_df, _matrix_result_focus
+                ),
+                hide_index=True,
+                use_container_width=True,
+                **_matrix_h_kw,
+            )
     with mq_right:
         st.markdown("##### Potential Spendings")
-        if _nc_sc:
-            st.caption(
-                "New category: Previous Year trend is unavailable, so PY-dependent Potential "
-                "Spendings are excluded."
-            )
-        elif _py_anom_sc:
-            st.caption(
-                "Previous Year anomaly: Spendings row relies on PY CR trend — excluded here; "
-                "Could be / diff / diff % shown as —."
-            )
-        _pot = _compute_potential_spendings_block(
-            paid_users_before,
-            paid_users_after,
-            spending_before,
-            spending_after,
-            active_before,
-            active_after,
-            matrix_py_paid_users_before,
-            matrix_py_paid_users_after,
-            matrix_py_ac_before,
-            matrix_py_ac_after,
-            omit_py=_nc_sc or _py_anom_sc,
-        )
-        _pot_df = _build_potential_spendings_table_df(
-            _pot,
-            omit_py_dependent_row=_nc_sc or _py_anom_sc,
-        )
-        st.dataframe(_pot_df, hide_index=True, use_container_width=True)
+        _render_analytics_potential_block(show_heading=False)
 
 st.markdown("##### Scenario")
-st.caption(
-    f"Активный сценарий: **{scenario}**. Переключение — в панели **Настройки** вверху страницы."
-)
+st.caption(f"Активный сценарий: **{scenario}** (переключение — блок **Настройки** под **Inputs**).")
 
 _ac1, _ac2 = st.columns([3, 1])
 with _ac1:
@@ -3396,89 +5267,243 @@ if _run_calc:
             is_other_category=scenario == "Other category",
         )
 
+        _nc_sc_run = _scenario_is_new_category(scenario)
+        _py_anom_sc_run = _scenario_is_py_anomaly(scenario)
+        _matrix_result_focus_run = (
+            "current_year" if (_nc_sc_run or _py_anom_sc_run) else "diff_y2y"
+        )
+        _is_other_run = _scenario_is_other_category(scenario)
+        _low_npl_override = scenario == "Low NPL (<10)" or paid_users_after < 10
+
+        # Results block must use the same primary comparison period as PPV matrix to avoid conflicting interpretations.
+        y2y_bundle = None
+        if _matrix_result_focus_run == "diff_y2y":
+            y2y_bundle = _results_compute_y2y_npl_sp_cr_bundle(
+                geo or "default",
+                paid_users_before,
+                paid_users_after,
+                spending_before,
+                spending_after,
+                active_before,
+                active_after,
+                matrix_py_paid_users_before,
+                matrix_py_paid_users_after,
+                matrix_py_spending_before,
+                matrix_py_spending_after,
+                matrix_py_ac_before,
+                matrix_py_ac_after,
+            )
+
+        if _matrix_result_focus_run == "current_year":
+            disp_dc = result["decision_code"]
+            disp_fd = result["final_decision"]
+            disp_ns = result["next_step"]
+        elif _is_other_run:
+            disp_dc = result["decision_code"]
+            disp_fd = result["final_decision"]
+            disp_ns = result["next_step"]
+        elif y2y_bundle and y2y_bundle["complete"]:
+            disp_dc = y2y_bundle["decision_code"]
+            dr = get_decision(disp_dc)
+            disp_fd = dr["decision"]
+            disp_ns = dr["next_step"]
+            if _low_npl_override:
+                disp_fd = result["final_decision"]
+                disp_ns = result["next_step"]
+        else:
+            disp_dc = "—"
+            disp_fd = "Insufficient data"
+            disp_ns = (
+                "Year-over-year comparison is unavailable for one or more metrics. "
+                "Enter Previous Year Paid users, Spending, and Active listers (Before and After) "
+                "so diff Y2Y can be computed for NPL, Spending, and Conversion."
+            )
+
         with st.container(border=True):
-            st.subheader("Results")
-            with st.expander("Детали по метрикам (NPL, Spending, CR)", expanded=False):
-                paid_users_row = (
-                    f"Paid users: {result['npl_diff']:.2f}% → "
-                    f"{decode_status(result['npl_code'])} ({result['npl_code']})"
+            st.markdown("##### Results")
+            if _category_single_mode:
+                _kp_single = _compute_single_executive_kpis(
+                    geo=geo or "default",
+                    matrix_result_focus_run=_matrix_result_focus_run,
+                    result=result,
+                    y2y_bundle=y2y_bundle,
+                    paid_users_before=paid_users_before,
+                    paid_users_after=paid_users_after,
+                    spending_before=spending_before,
+                    spending_after=spending_after,
+                    active_before=active_before,
+                    active_after=active_after,
+                    matrix_py_ac_before=matrix_py_ac_before,
+                    matrix_py_ac_after=matrix_py_ac_after,
                 )
-                if result["npl_code"] == "G":
-                    st.success(paid_users_row)
-                elif result["npl_code"] == "D":
-                    st.error(paid_users_row)
-                else:
-                    st.warning(paid_users_row)
+                _render_single_executive_summary(_kp_single, disp_fd)
 
-                sp_text = f"Spending: {result['sp_diff']:.2f}% → {decode_status(result['sp_code'])} ({result['sp_code']})"
-                if result["sp_code"] == "G":
-                    st.success(sp_text)
-                elif result["sp_code"] == "D":
-                    st.error(sp_text)
-                else:
-                    st.warning(sp_text)
+            with st.expander("Детали по метрикам (NPL, Spending, CR)", expanded=False):
+                if _matrix_result_focus_run == "current_year":
+                    paid_users_row = (
+                        f"Paid users: {result['npl_diff']:.2f}% → "
+                        f"{decode_status(result['npl_code'])} ({result['npl_code']})"
+                    )
+                    if result["npl_code"] == "G":
+                        st.success(paid_users_row)
+                    elif result["npl_code"] == "D":
+                        st.error(paid_users_row)
+                    else:
+                        st.warning(paid_users_row)
 
-                cr_text = f"Conversion: {result['cr_diff']:.2f}% → {decode_status(result['cr_code'])} ({result['cr_code']})"
-                if result["cr_code"] == "G":
-                    st.success(cr_text)
-                elif result["cr_code"] == "D":
-                    st.error(cr_text)
-                else:
-                    st.warning(cr_text)
+                    sp_text = (
+                        f"Spending: {result['sp_diff']:.2f}% → "
+                        f"{decode_status(result['sp_code'])} ({result['sp_code']})"
+                    )
+                    if result["sp_code"] == "G":
+                        st.success(sp_text)
+                    elif result["sp_code"] == "D":
+                        st.error(sp_text)
+                    else:
+                        st.warning(sp_text)
 
-            st.markdown("**Decision code**")
-            st.code(result["decision_code"])
+                    cr_text = (
+                        f"Conversion (CR): {result['cr_diff']:.2f}% → "
+                        f"{decode_status(result['cr_code'])} ({result['cr_code']})"
+                    )
+                    if result["cr_code"] == "G":
+                        st.success(cr_text)
+                    elif result["cr_code"] == "D":
+                        st.error(cr_text)
+                    else:
+                        st.warning(cr_text)
+                elif y2y_bundle is not None:
+                    op = _is_other_run
+                    _results_render_metric_detail_row(
+                        "Paid users / NPL (Y2Y)",
+                        y2y_bundle["y2y_npl"],
+                        y2y_bundle["npl_code"],
+                        op,
+                    )
+                    _results_render_metric_detail_row(
+                        "Spending (Y2Y)",
+                        y2y_bundle["y2y_sp"],
+                        y2y_bundle["sp_code"],
+                        op,
+                    )
+                    _results_render_metric_detail_row(
+                        "CR (Y2Y)",
+                        y2y_bundle["y2y_cr"],
+                        y2y_bundle["cr_code"],
+                        op,
+                    )
 
-            st.markdown("**Final decision**")
-            final_decision = result["final_decision"]
-            if final_decision == "Positive impact":
-                st.success(final_decision)
-            elif final_decision == "Negative impact":
-                st.error(final_decision)
-            elif final_decision == "No impact":
-                st.info(final_decision)
+            if _category_single_mode:
+                _render_single_outcome_hero_and_actions(disp_dc, disp_fd, disp_ns)
             else:
-                st.warning(final_decision)
+                st.markdown("**Decision code**")
+                st.code(disp_dc)
 
-            st.markdown("**Next step**")
-            st.info(result["next_step"])
+                st.markdown("**Final decision**")
+                final_decision = disp_fd
+                if final_decision == "Positive impact":
+                    st.success(final_decision)
+                elif final_decision == "Negative impact":
+                    st.error(final_decision)
+                elif final_decision == "No impact":
+                    st.info(final_decision)
+                else:
+                    st.warning(final_decision)
+
+                st.markdown("**Next step**")
+                st.info(disp_ns)
 
 if _category_bulk_mode:
     st.subheader("Bulk analysis")
     st.caption(
-        "Используются загруженные Current Year / Previous Year данные и выбранные GEO и Scenario. "
+        "Используются загруженные Current Year / Previous Year данные и **GEO**. "
+        "**Scenario** сверху задаёт default для всех категорий; для исключений — списки ниже. "
         "Price data в bulk не используется."
     )
+    with st.expander("Bulk scenario overrides", expanded=False):
+        st.caption(
+            "ID через запятую, пробел, `;` или перенос строки. "
+            "Приоритет при дублях: Other category → New category → Previous Year anomaly."
+        )
+        st.text_area(
+            "New category IDs",
+            placeholder="e.g. 1001, 1002",
+            key="bulk_override_new_cat_ids",
+            height=88,
+        )
+        st.text_area(
+            "Previous Year anomaly IDs",
+            placeholder="Categories with PY merge but Y2Y excluded",
+            key="bulk_override_py_anomaly_ids",
+            height=88,
+        )
+        st.text_area(
+            "Other category IDs",
+            placeholder="Categories evaluated with Other category matrix",
+            key="bulk_override_other_cat_ids",
+            height=88,
+        )
+
+    _ov_o, _bad_o = _parse_category_ids(st.session_state.get("bulk_override_other_cat_ids", ""))
+    _ov_n, _bad_n = _parse_category_ids(st.session_state.get("bulk_override_new_cat_ids", ""))
+    _ov_p, _bad_p = _parse_category_ids(st.session_state.get("bulk_override_py_anomaly_ids", ""))
+    _ov_warn_parts = []
+    if _bad_o:
+        _ov_warn_parts.append(f"Other IDs: пропущены токены {_bad_o[:15]!r}{'…' if len(_bad_o) > 15 else ''}")
+    if _bad_n:
+        _ov_warn_parts.append(f"New category IDs: пропущены токены {_bad_n[:15]!r}{'…' if len(_bad_n) > 15 else ''}")
+    if _bad_p:
+        _ov_warn_parts.append(
+            f"PY anomaly IDs: пропущены токены {_bad_p[:15]!r}{'…' if len(_bad_p) > 15 else ''}"
+        )
+    if _ov_warn_parts:
+        st.warning("\n".join(_ov_warn_parts))
+
+    _ov_conf = _bulk_override_conflict_messages(
+        set(_ov_o), set(_ov_n), set(_ov_p)
+    )
+    if _ov_conf:
+        st.warning("\n\n".join(_ov_conf))
+
     _bulk_sig = (
-        tuple(parsed_category_ids),
+        tuple(_bulk_effective_category_ids),
         str(geo or ""),
         str(scenario),
         st.session_state.get("_upload_sig"),
         st.session_state.get("_upload_sig_py"),
+        str(st.session_state.get("bulk_override_other_cat_ids", "")),
+        str(st.session_state.get("bulk_override_new_cat_ids", "")),
+        str(st.session_state.get("bulk_override_py_anomaly_ids", "")),
     )
     if st.session_state.get("_bulk_analysis_sig") != _bulk_sig:
         st.session_state.pop("bulk_analysis_result", None)
     st.session_state["_bulk_analysis_sig"] = _bulk_sig
 
-    _force_low = scenario == "Low NPL (<10)"
-    _is_other = scenario == "Other category"
     if st.button("Run bulk analysis", type="primary", key="run_bulk_analysis"):
         if not merged_data:
-            st.warning("Загрузите Current Year файлы (spending, active, price), чтобы строить bulk-таблицу.")
+            st.warning(
+                "Загрузите Current Year: **New PPV (spending)** и **Active listers** "
+                "(минимум), чтобы строить bulk-таблицу."
+            )
         else:
             st.session_state["bulk_analysis_result"] = _bulk_analysis_dataframe(
-                parsed_category_ids,
+                _bulk_effective_category_ids,
                 merged_data,
                 merged_data_previous_year or {},
                 geo,
-                _force_low,
-                _is_other,
-                _scenario_is_new_category(scenario),
-                _scenario_is_py_anomaly(scenario),
+                scenario,
+                list(_ov_o),
+                list(_ov_n),
+                list(_ov_p),
             )
             st.session_state["bulk_run_nonce"] = int(st.session_state.get("bulk_run_nonce", 0)) + 1
 
     _bulk_df = st.session_state.get("bulk_analysis_result")
+    if merged_data and _bulk_df is None:
+        st.info(
+            "Нажмите **Run bulk analysis**, чтобы выполнить расчёт по всем выбранным ID "
+            "(поле Category ID или **Bulk: Category ID из Current Year файла**)."
+        )
     if _bulk_df is not None and not _bulk_df.empty:
         _bulk_render_insights(_bulk_df)
         _bulk_render_summary(_bulk_df)
@@ -3535,14 +5560,86 @@ if _category_bulk_mode:
         st.caption(
             f"Showing {len(_filtered_bulk)} of {len(_bulk_df)} categories"
         )
-        _bulk_table_display = _bulk_styled_dataframe(
-            _bulk_format_table_for_display(
-                _filtered_bulk,
-                new_category_mode=_scenario_is_new_category(scenario),
-                py_anomaly_mode=_scenario_is_py_anomaly(scenario),
+        _bulk_render_compact_dashboard(_bulk_df)
+        if _filtered_bulk.empty and not _bulk_df.empty:
+            st.warning(
+                "По выбранным фильтрам не осталось ни одной строки. "
+                "Измените **Priority**, **final_decision** или **warning_flags**, чтобы вернуть категории в таблицу."
             )
-        )
-        st.dataframe(_bulk_table_display, use_container_width=True)
+        if not _filtered_bulk.empty:
+            st.markdown("##### Таблица")
+            _base = _filtered_bulk.reset_index(drop=True)
+            _fmt = _bulk_format_table_for_display(
+                _base,
+                new_category_mode=False,
+                py_anomaly_mode=False,
+            )
+            _fmt = _fmt.copy()
+            if "next_step" in _base.columns:
+                _fmt["next_step"] = _base["next_step"].map(_bulk_next_step_short_cell)
+            else:
+                _fmt["next_step"] = "—"
+            _summary_cols = [c for c in _BULK_SUMMARY_COLUMNS if c in _fmt.columns]
+            _compact = _bulk_format_compact_diff_pct_columns(_fmt[_summary_cols].copy())
+            _compact = _bulk_mask_py_y2y_cells_by_scenario(_base, _compact)
+            _compact[_BULK_TABLE_DETAILS_COL] = _BULK_TABLE_DETAILS_CELL
+            _col_order = [_BULK_TABLE_DETAILS_COL] + [
+                c for c in _BULK_SUMMARY_COLUMNS if c in _compact.columns and c != _BULK_TABLE_DETAILS_COL
+            ]
+            _compact = _compact[_col_order]
+            _styled_compact = _bulk_styled_dataframe(_compact, style_source=_base)
+
+            st.caption("Click on a row to see category details below")
+
+            _df_sig = inspect.signature(st.dataframe).parameters
+            _df_kw: dict = {}
+            if "hide_index" in _df_sig:
+                _df_kw["hide_index"] = True
+            if "width" in _df_sig:
+                _df_kw["width"] = "stretch"
+            elif "use_container_width" in _df_sig:
+                _df_kw["use_container_width"] = True
+
+            if "column_config" in _df_sig:
+                _df_kw["column_config"] = _bulk_compact_table_column_config(
+                    list(_compact.columns)
+                )
+
+            _bulk_table_key = f"bulk_compact_select_{_bulk_nonce}"
+            _sel_rows: list[int] = []
+            _supports_row_pick = (
+                "on_select" in _df_sig and "selection_mode" in _df_sig and "key" in _df_sig
+            )
+
+            if _supports_row_pick:
+                _ev = st.dataframe(
+                    _styled_compact,
+                    key=_bulk_table_key,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    **_df_kw,
+                )
+                _sel_rows = _bulk_dataframe_selection_rows(_ev)
+            else:
+                st.dataframe(_styled_compact, **_df_kw)
+
+            if not _sel_rows and _supports_row_pick:
+                st.caption("Click on a row in the table above to open details.")
+            elif not _sel_rows:
+                _opts = [_bulk_expander_title_for_row(_base.iloc[i]) for i in range(len(_base))]
+                _j = st.selectbox(
+                    "Развернуть детали категории",
+                    options=list(range(len(_base))),
+                    format_func=lambda i: _opts[i],
+                    key=f"bulk_detail_pick_{_bulk_nonce}",
+                )
+                _sel_rows = [int(_j)]
+
+            if _sel_rows:
+                _row_sel = _base.iloc[int(_sel_rows[0])]
+                with st.expander("Category details", expanded=True):
+                    _bulk_render_category_drill_down(_row_sel, merged_data)
+
         _csv_bytes = _bulk_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             label="Download CSV",
