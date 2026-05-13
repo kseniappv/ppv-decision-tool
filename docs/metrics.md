@@ -82,6 +82,19 @@ py_metric_diff = _engine_style_diff(before_py, after_py)
 
 **Не участвуют** в **`analyze_category`** и в **Y2Y decision bundle**.
 
+## Potential Spendings (только отображение)
+
+Блок считается **`_compute_potential_spendings_block`** и **не влияет** на **`analyze_category`**. При **`omit_py`** (сценарии **New category** / **Previous Year anomaly**) строка **Spendings** без PY‑модели (**Could be / diff / diff %** — «—»).
+
+| Показатель | Источник (кратко) |
+|------------|-------------------|
+| **ARPpU Fact** | `spending_after / paid_users_after` (CY) |
+| **ARPpU Could be** | `spending_before / paid_users_before` (CY) |
+| **Spendings Fact** | `spending_after` (CY) |
+| **Spendings Could be** | При полном PY: `active_after × expected_cr_after × could_be_arppu`, где **`expected_cr_after`** из **PY** динамики CR при известной **CY CR** «до» (см. **`app.py`**) |
+
+Для строк таблицы: **diff %** = **`((Fact / Could be) − 1) · 100`** при валидной базе (**`_potential_spendings_row_diff_pct`**), абсолютный **diff** = **`Fact − Could be`**. UI (таблица / KPI, фиксированные ширины, стиль **diff %**) — [ui_ux_rules.md](ui_ux_rules.md).
+
 ## Участие в decision (кратко)
 
 | Метрика / производная | В decision? |

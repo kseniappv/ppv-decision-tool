@@ -34,7 +34,7 @@ Single режим активен, когда в текущих данных ре
 
 - **New category** или **Previous Year anomaly**: PY‑зависимая часть опускается (`omit_py` / `omit_py_dependent_row` — строка Spendings или поля Could be / diff / diff % могут быть **—**).
 - **Single** (`_category_single_mode`): вместо таблицы — **KPI‑карточки** (**`_render_potential_spendings_kpi_cards`**).
-- **Рядом с PPV matrix** (не single): компактная **таблица** `st.dataframe` с **фиксированными ширинами столбцов в пикселях** и фиксированной шириной виджета (**`_potential_spendings_table_dataframe_kwargs`**), стилизация **`diff %`** через **`_potential_spendings_style_table`**. Подробности — [ui_ux_rules.md](ui_ux_rules.md) (раздел Potential Spendings).
+- **Рядом с PPV matrix** (не single): компактная **таблица** `st.dataframe` с **фиксированными ширинами столбцов в пикселях** и фиксированной шириной виджета (**`_potential_spendings_table_dataframe_kwargs`**), стилизация **`diff %`** через **`_potential_spendings_style_table`**. Подробности — [ui_ux_rules.md](ui_ux_rules.md) (раздел Potential Spendings). Формулы показателей — [metrics.md](metrics.md) (раздел Potential Spendings).
 
 ## Кнопка Calculate
 
