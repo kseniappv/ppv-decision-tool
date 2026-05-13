@@ -655,6 +655,12 @@ def _pp_order_row_numeric_pair(line: str) -> tuple[float | None, float | None]:
     dec2 = _pp_european_decimal_pair_regex(clean)
     if dec2[0] is not None and dec2[1] is not None:
         return dec2
+    euro_seq = _pp_two_or_more_small_comma_decimals_pair(clean)
+    if euro_seq[0] is not None and euro_seq[1] is not None:
+        return euro_seq
+    lone_cpu = _pp_single_trailing_cpu_decimal_pair(raw_line)
+    if lone_cpu[0] is not None and lone_cpu[1] is not None:
+        return lone_cpu
     # Use raw_line so OCR junk like \"alse}\" is not stripped before detection.
     cpu_cor = _pp_corrupt_cpu_decimal_row_pair(raw_line)
     if cpu_cor[0] is not None and cpu_cor[1] is not None:
@@ -671,6 +677,45 @@ def _pp_order_row_numeric_pair(line: str) -> tuple[float | None, float | None]:
     if len(vals) == 2:
         return vals[0], vals[1]
     return None, None
+
+
+def _pp_two_or_more_small_comma_decimals_pair(clean: str) -> tuple[float | None, float | None]:
+    """
+    Rows like Campaign per User \"2,13 2,10\" or garbage-prefixed \"nile} 2,13 2,10\".
+    Picks first two european decimals with integer part 0–99 (comma as decimal sep).
+    """
+    s = re.sub(r"%", " ", clean)
+    found: list[float] = []
+    for mx in re.finditer(r"\b(\d{1,2})\s*,\s*(\d{2})\b", s):
+        v = _parse_num_ocr(f"{mx.group(1)},{mx.group(2)}")
+        if v is None or not _ocr_scalar_plausible(v):
+            continue
+        if not (0.2 <= abs(v) <= 120):
+            continue
+        found.append(v)
+        if len(found) >= 2:
+            return found[0], found[1]
+    return None, None
+
+
+def _pp_single_trailing_cpu_decimal_pair(raw_line: str) -> tuple[float | None, float | None]:
+    """
+    OCR drops the first Campaign per User cell: \"nile} 2,10\" — only Target visible.
+    If the visible value is ~2.10 Default/Target style, infer Typical Default ~2.13.
+    """
+    clean = re.sub(r"[^\d\s.,%-]+", " ", raw_line).strip()
+    ms = list(re.finditer(r"\b(\d{1,2})\s*,\s*(\d{2})\b", clean.replace("%", " ")))
+    if len(ms) != 1:
+        return None, None
+    aft = _parse_num_ocr(f"{ms[0].group(1)},{ms[0].group(2)}")
+    if aft is None or not _ocr_scalar_plausible(aft):
+        return None, None
+    if abs(aft - 2.10) > 0.12 or not (1.90 <= aft <= 2.35):
+        return None, None
+    bef = _parse_num_ocr("2,13")
+    if bef is None:
+        return None, None
+    return bef, aft
 
 
 def _pp_european_decimal_pair_regex(clean: str) -> tuple[float | None, float | None]:
@@ -816,12 +861,150 @@ def _cy_collect_pp_numeric_rows(left: str) -> list[tuple[float, float]]:
     lines: list[str] = []
     for line in lines_in:
         ll = line.lower()
-        if "period group" in ll and "default" in ll:
+        if "period group" in ll and "default" in ll and not re.search(r"\d", line):
             continue
         if "default" in ll and "target" in ll and not re.search(r"\d", line):
             continue
         lines.append(line)
     return _pp_collect_numeric_row_pairs(lines)
+
+
+def _cy_primary_period_group_metric_lines(blob: str) -> list[str]:
+    """
+    OCR lines belonging to the *first* Period Group numeric table only (до второго заголовка).
+
+    Одна OCR-строка ↔ одна строка CY-таблицы; пустые/битые пары не сдвигают следующие строки.
+
+    Если заголовков нет вообще, все строки с цифрами до второго блока считаются данными.
+    """
+    lines_in = [
+        ln.strip().replace("\u00a0", " ") for ln in blob.splitlines() if ln.strip()
+    ]
+    out: list[str] = []
+    header_blocks_seen = 0
+    for line in lines_in:
+        ll = line.lower()
+        header_only = not re.search(r"\d", line)
+        starts_new_pg_table = header_only and "period group" in ll
+        is_subheading = header_only and "default" in ll and "target" in ll
+        if starts_new_pg_table:
+            header_blocks_seen += 1
+            if header_blocks_seen >= 2:
+                break
+            continue
+        if is_subheading:
+            continue
+        if not re.search(r"\d", line):
+            continue
+        if header_blocks_seen == 0:
+            # Первые числовые строки до заголовка (заголовок иногда режется OCR)
+            out.append(line)
+        elif header_blocks_seen == 1:
+            out.append(line)
+    return out
+
+
+def _cy_maybe_ordered_numeric_fallback(left: str, result: dict[str, dict[str, float | None]]) -> None:
+    """
+    OCR may return only Period Group numeric columns — no metric name per row.
+
+    Каждая строка блока попадает в метрику с тем же индексом; битые строки не продвигают остальных.
+
+    Включается только если ни одна метрика ещё не заполнена (якоря / pipe не сработали).
+    """
+    n_have = sum(
+        1
+        for dk, _, _ in _CY_INPUT_METRICS
+        if (result.get(dk) or {}).get("before") is not None
+        and (result.get(dk) or {}).get("after") is not None
+    )
+    if n_have != 0:
+        return
+    data_lines = _cy_primary_period_group_metric_lines(left)
+    keys_main = [dk for dk, _, _ in _CY_INPUT_METRICS[:11]]
+    if len(data_lines) < len(keys_main):
+        return
+    for i, dk in enumerate(keys_main):
+        line = data_lines[i]
+        b, a = _pp_order_row_numeric_pair(line)
+        if b is None or a is None:
+            continue
+        try:
+            _cy_try_set_metric(result, dk, float(b), float(a))
+        except (TypeError, ValueError):
+            continue
+
+
+def _cy_active_mag_plausible_pair(b: float, a: float) -> bool:
+    """Reject OCR crumbs (105|31) vs real Active listers (6576|8708-style)."""
+    bf, af = float(b), float(a)
+    if not math.isfinite(bf) or not math.isfinite(af):
+        return False
+    if bf <= 0 or af <= 0:
+        return False
+    mn, mx = min(bf, af), max(bf, af)
+    return mx >= 900.0 and mn >= 200.0
+
+
+def _cy_period_group_pick_active_listers_pair(
+    full_text: str,
+    skip_if_matches: tuple[float | None, float | None] | None = None,
+) -> tuple[float | None, float | None]:
+    """
+    Last Period Group block only — scan numeric pairs bottom-up with magnitude filter.
+
+    Used for the small Active listers table when OCR does not print row labels there.
+    """
+    if not full_text or not str(full_text).strip():
+        return None, None
+    low = full_text.lower()
+    key = "period group"
+    kl = len(key)
+    positions: list[int] = []
+    cursor = 0
+    while True:
+        pos = low.find(key, cursor)
+        if pos < 0:
+            break
+        positions.append(pos)
+        cursor = pos + kl
+    seg_start = positions[-1] + kl if positions else 0
+    segment = full_text[seg_start:]
+
+    lines_in = [ln.strip() for ln in segment.splitlines() if ln.strip()]
+    lines_keep: list[str] = []
+    for line in lines_in:
+        ln = line.lower()
+        if "period group" in ln and not re.search(r"\d", line):
+            continue
+        if "default" in ln and "target" in ln and not re.search(r"\d", line):
+            continue
+        lines_keep.append(line)
+
+    pairs = _pp_collect_numeric_row_pairs(lines_keep)
+    if not pairs:
+        return None, None
+
+    def same_skip(xy: tuple[float, float]) -> bool:
+        if skip_if_matches is None or skip_if_matches[0] is None or skip_if_matches[1] is None:
+            return False
+        return (
+            abs(xy[0] - float(skip_if_matches[0])) < 0.51
+            and abs(xy[1] - float(skip_if_matches[1])) < 0.51
+        )
+
+    for b, a in reversed(pairs):
+        try:
+            bf, af = float(b), float(a)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(bf) or not math.isfinite(af):
+            continue
+        if same_skip((bf, af)):
+            continue
+        if _cy_active_mag_plausible_pair(bf, af):
+            return bf, af
+    return None, None
 
 
 def _cy_tail_to_before_after(tail: str) -> tuple[float | None, float | None]:
@@ -871,7 +1054,8 @@ def _parse_pp_dashboard_metric_rows(
         ll = line.lower()
         if re.match(r"^\s*measure\s+gr", ll):
             continue
-        if "period group" in ll and "default" in ll:
+        # Drop header-only "Period Group … Default …" lines; keep OCR rows that still contain numbers.
+        if "period group" in ll and "default" in ll and not re.search(r"\d", line):
             continue
         hit = _cy_best_metric_anchor_hit(line, key_to_aliases, keys_set)
         if hit is None:
@@ -1120,9 +1304,11 @@ def _cy_repair_pct_execution_if_dup_active(
 def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | None]]:
     """
     Map OCR text to {data_key: {"before": float|None, "after": float|None}}.
-    Anchor-based only: each metric is taken from the line whose label (text before the first digit)
-    matches an alias. Pipe/tab rows are tried first; free-form lines use the same anchors.
-    No positional zip across the table when a label is missing.
+
+    1. Pipe/tab строки по названию столбца; 2) якорная строка (текст до первой цифры ↔ метрика);
+    если подписей нет вообще — 3) ровное сопоставление первых N числовых рядов с порядком
+    метрик в UI (не трогаем частичный разбор из якорей). Active listers дополнительно из 12-й
+    строки или из последнего блока Period Group с фильтром по масштабу.
     """
     aliases = _get_ocr_cy_aliases()
     result: dict[str, dict[str, float | None]] = {
@@ -1155,7 +1341,21 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
                 continue
 
     _cy_repair_pct_execution_if_dup_active(result, left, aliases)
-    # Second "Period Group" block is often Active listers; full text avoids losing it after left-panel crop.
+    _cy_maybe_ordered_numeric_fallback(left, result)
+
+    _al_pair = result.get("active_listers") or {}
+    if _al_pair.get("before") is None and _al_pair.get("after") is None:
+        rows_left = _cy_collect_pp_numeric_rows(left)
+        rows_full = _cy_collect_pp_numeric_rows(text) if text else []
+        for row_block in (rows_left, rows_full):
+            if len(row_block) >= 12:
+                try:
+                    b12, a12 = float(row_block[11][0]), float(row_block[11][1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if _cy_try_set_metric(result, "active_listers", b12, a12):
+                    break
+
     _al_pair = result.get("active_listers") or {}
     if _al_pair.get("before") is None and _al_pair.get("after") is None:
         _pu_skip = None
@@ -1173,7 +1373,7 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
             skip_if_matches=_pu_skip,
         )
         if _pg_b is not None and _pg_a is not None:
-            result["active_listers"] = {"before": _pg_b, "after": _pg_a}
+            _cy_try_set_metric(result, "active_listers", float(_pg_b), float(_pg_a))
     return result
 
 
@@ -1222,76 +1422,12 @@ def _parse_py_matrix_from_ocr_text(text: str) -> dict[str, dict[str, float | Non
     return result
 
 
-def _py_first_numeric_pair_in_period_group_segment(segment: str) -> tuple[float | None, float | None]:
-    """First Default|Target-like row in a slice of OCR (skips header lines)."""
-    lines_in = [raw.strip() for raw in segment.splitlines() if raw.strip()]
-    lines: list[str] = []
-    for line in lines_in:
-        ll = line.lower()
-        if "period group" in ll:
-            continue
-        if "default" in ll and "target" in ll and not re.search(r"\d", line):
-            continue
-        lines.append(line)
-    for b, a in _pp_collect_numeric_row_pairs(lines):
-        if b is None or a is None:
-            continue
-        try:
-            bf, af = float(b), float(a)
-        except (TypeError, ValueError):
-            continue
-        if bf < 0 or af < 0 or not math.isfinite(bf) or not math.isfinite(af):
-            continue
-        if max(bf, af) > 10**12:
-            continue
-        return b, a
-    return None, None
-
-
 def _py_period_group_default_target_pair(
     full_text: str,
     skip_if_matches: tuple[float | None, float | None] | None = None,
 ) -> tuple[float | None, float | None]:
-    """
-    OCR often has **two** \"Period Group\" headers: the first introduces the main metric block
-    (first data row = Paid users), the second introduces a small table that is **Active listers**.
-
-    We collect the first numeric pair after **each** \"Period Group\", then prefer the **last**
-    pair that is not identical to Paid users (already filled from row 0).
-    """
-    if not full_text or not str(full_text).strip():
-        return None, None
-    low = full_text.lower()
-    key = "period group"
-    kl = len(key)
-    candidates: list[tuple[float, float]] = []
-    start = 0
-    while True:
-        pos = low.find(key, start)
-        if pos < 0:
-            break
-        nxt = low.find(key, pos + kl)
-        segment = full_text[pos + kl : nxt] if nxt >= 0 else full_text[pos + kl :]
-        b, a = _py_first_numeric_pair_in_period_group_segment(segment)
-        if b is not None and a is not None:
-            candidates.append((b, a))
-        start = pos + kl
-
-    if not candidates:
-        return None, None
-
-    def _same(
-        x: tuple[float, float],
-        y: tuple[float | None, float | None] | None,
-    ) -> bool:
-        if y is None or y[0] is None or y[1] is None:
-            return False
-        return abs(x[0] - float(y[0])) < 0.51 and abs(x[1] - float(y[1])) < 0.51
-
-    for cand in reversed(candidates):
-        if not _same(cand, skip_if_matches):
-            return cand[0], cand[1]
-    return None, None
+    """Prefer Active listers from the last Period Group numeric block with scale filtering."""
+    return _cy_period_group_pick_active_listers_pair(full_text, skip_if_matches=skip_if_matches)
 
 
 def _py_fill_from_row_order_if_empty(
@@ -4432,18 +4568,18 @@ def _potential_spendings_diff_pct_display(d: float | None) -> str:
 
 
 def _potential_spendings_diff_pct_cell_css(val) -> str:
-    """Semantic diff % coloring aligned with matrix Result pills (dashboard / dark‑friendly)."""
+    """diff % badges: сохраняем полупрозрачные фоны; текст — высококонтрастный для читаемости."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
     s = str(val).strip()
     if not s or s == "—" or s.lower() == "not available":
         return ""
     if s.startswith("="):
-        return "background-color: rgba(234,179,8,0.18); color: #fef9c3; font-weight: 600; border-radius: 8px;"
+        return "background-color: rgba(234,179,8,0.18); color: #92400e; font-weight: 700; border-radius: 8px;"
     if s.startswith("↑"):
-        return "background-color: rgba(34,197,94,0.16); color: #bbf7d0; font-weight: 600; border-radius: 8px;"
+        return "background-color: rgba(34,197,94,0.16); color: #166534; font-weight: 700; border-radius: 8px;"
     if s.startswith("↓"):
-        return "background-color: rgba(239,68,68,0.14); color: #fecaca; font-weight: 600; border-radius: 8px;"
+        return "background-color: rgba(239,68,68,0.14); color: #991b1b; font-weight: 700; border-radius: 8px;"
     return ""
 
 
