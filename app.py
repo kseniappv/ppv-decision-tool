@@ -148,7 +148,8 @@ _LAYOUT_COMPACT_CSS = """
 /* Softer dataframe chrome; use full column width (semantic cell styling unchanged) */
 [data-testid="stDataFrame"] {
     border-radius: 10px;
-    overflow: visible;
+    overflow-x: auto;
+    overflow-y: visible;
     border: 1px solid rgba(148,163,184,0.18);
     width: 100%;
     max-width: none;
@@ -4591,26 +4592,31 @@ def _potential_spendings_style_table(df: pd.DataFrame):
 
 
 def _potential_spendings_table_dataframe_kwargs() -> dict:
-    """Wider columns for the small Potential table (display only)."""
+    """Fixed px columns + dataframe width so the grid stays readable (no manual resize)."""
     out: dict = {}
     try:
         sig = inspect.signature(st.dataframe).parameters
         if "column_config" not in sig:
             return out
+        # Integer widths → Glide pinned widths (Streamlit 1.46+).
+        _w_metric, _w_fact, _w_could, _w_diff, _w_pct = 200, 128, 176, 120, 210
         out["column_config"] = {
             "Potential Spendings": st.column_config.TextColumn(
                 "Potential Spendings",
-                width="medium",
+                width=_w_metric,
             ),
-            "Fact": st.column_config.TextColumn("Fact", width="large"),
-            "Could be": st.column_config.TextColumn("Could be", width="large"),
-            "diff": st.column_config.TextColumn("diff", width="medium"),
-            "diff %": st.column_config.TextColumn("diff %", width="large"),
+            "Fact": st.column_config.TextColumn("Fact", width=_w_fact),
+            "Could be": st.column_config.TextColumn("Could be", width=_w_could),
+            "diff": st.column_config.TextColumn("diff", width=_w_diff),
+            "diff %": st.column_config.TextColumn("diff %", width=_w_pct),
         }
         if "hide_index" in sig:
             out["hide_index"] = True
         if "use_container_width" in sig:
-            out["use_container_width"] = True
+            out["use_container_width"] = False
+        if "width" in sig:
+            # Sum of column widths + grid chrome / padding (hide_index → no index col).
+            out["width"] = _w_metric + _w_fact + _w_could + _w_diff + _w_pct + 44
     except (TypeError, ValueError):
         return {}
     return out
