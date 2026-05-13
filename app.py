@@ -216,6 +216,43 @@ def _cy_alias_search(line: str, al: str) -> re.Match | None:
     return re.search(_cy_alias_regex_pattern(al), line, re.I)
 
 
+def _cy_label_head_until_first_digit(line: str) -> str:
+    """Left part of a dashboard row before the first ASCII digit starts the numeric columns."""
+    m = re.search(r"\d", line)
+    if not m:
+        return line
+    return line[: m.start()]
+
+
+def _cy_best_metric_anchor_hit(
+    line: str,
+    aliases: dict[str, tuple[str, ...]],
+    allowed_keys: set[str] | None = None,
+) -> tuple[str, int] | None:
+    """
+    Pick the longest matching alias occurring only inside the textual label prefix (anchor-based).
+    Resolves ambiguity by: longer alias wins, then leftmost match, then longest span end.
+    """
+    head_raw = _cy_label_head_until_first_digit(line.strip())
+    if not head_raw.strip():
+        return None
+    head = head_raw
+    ak = aliases.keys() if allowed_keys is None else allowed_keys
+    candidates: list[tuple[int, int, int, str, str]] = []
+    for dk in ak:
+        for al in aliases.get(dk, ()):
+            mx = _cy_alias_search(head, al)
+            if not mx:
+                continue
+            L = len(al)
+            candidates.append((L, -mx.start(), mx.end(), dk, al))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _L, _ns, endpos, dk, _al = candidates[0]
+    return dk, endpos
+
+
 def _cy_pair_equal(
     b1: float | None, a1: float | None, b2: float | None, a2: float | None, eps: float = 0.51
 ) -> bool:
@@ -787,37 +824,6 @@ def _cy_collect_pp_numeric_rows(left: str) -> list[tuple[float, float]]:
     return _pp_collect_numeric_row_pairs(lines)
 
 
-def _cy_fill_from_row_order_if_empty(left: str, result: dict[str, dict[str, float | None]]) -> None:
-    """
-    Fallback when labels are unreadable or the Active Listers mini-table OCR is noisy:
-
-    * Map rows [0..10] → first 11 _CY_INPUT_METRICS only for keys that still have **no** values.
-    * Row [11] → active_listers if still entirely empty.
-
-    Previously we bailed whenever *any* metric was resolved, so Active Listers stayed blank
-    whenever Paid users / Spending / etc. matched by label — rows 12 never ran.
-    """
-    rows = _cy_collect_pp_numeric_rows(left)
-    if not rows:
-        return
-
-    keys_in_order = [dk for dk, _, _ in _CY_INPUT_METRICS]
-    for i, dk in enumerate(keys_in_order[:11]):
-        if i >= len(rows):
-            break
-        cur = result.get(dk) or {}
-        if cur.get("before") is not None or cur.get("after") is not None:
-            continue
-        b, a = rows[i]
-        _cy_try_set_metric(result, dk, b, a)
-
-    dk_al = "active_listers"
-    cur_al = result.get(dk_al) or {}
-    if len(rows) >= 12 and cur_al.get("before") is None and cur_al.get("after") is None:
-        b11, a11 = rows[11]
-        _cy_try_set_metric(result, dk_al, b11, a11)
-
-
 def _cy_tail_to_before_after(tail: str) -> tuple[float | None, float | None]:
     """Numbers after a matched metric label on one OCR line (PP dashboard row)."""
     tail = re.sub(r"(?i)\bAI(\d{2,3})\b", r"1\1", tail)
@@ -850,17 +856,14 @@ def _parse_pp_dashboard_metric_rows(
     keys_to_fill: list[str] | None = None,
 ) -> dict[str, dict[str, float | None]]:
     """
-    Row-wise: Metric ... [junk] Default Target (PPV spending layout).
+    Row-wise: textual metric label anchor (prefix before digits) … [junk] Default Target.
+    Exactly one metric per OCR line — no positional zip across the table.
     """
     keys = keys_to_fill or list(key_to_aliases.keys())
+    keys_set = {k for k in keys if k in key_to_aliases}
     result: dict[str, dict[str, float | None]] = {
-        k: {"before": None, "after": None} for k in keys
+        k: {"before": None, "after": None} for k in keys_set
     }
-    ordered_dk = sorted(
-        [k for k in keys if k in key_to_aliases],
-        key=lambda k: max(len(s) for s in key_to_aliases[k]),
-        reverse=True,
-    )
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -870,17 +873,16 @@ def _parse_pp_dashboard_metric_rows(
             continue
         if "period group" in ll and "default" in ll:
             continue
-        for dk in ordered_dk:
-            if result[dk]["before"] is not None and result[dk]["after"] is not None:
-                continue
-            for al in sorted(key_to_aliases[dk], key=len, reverse=True):
-                mx = _cy_alias_search(line, al)
-                if not mx:
-                    continue
-                tail = line[mx.end() :]
-                b, a = _cy_tail_to_before_after(tail)
-                if b is not None and a is not None and _cy_try_set_metric(result, dk, b, a):
-                    break
+        hit = _cy_best_metric_anchor_hit(line, key_to_aliases, keys_set)
+        if hit is None:
+            continue
+        dk, anchor_end = hit
+        if result[dk]["before"] is not None and result[dk]["after"] is not None:
+            continue
+        tail = line[anchor_end:]
+        b, a = _cy_tail_to_before_after(tail)
+        if b is not None and a is not None:
+            _cy_try_set_metric(result, dk, b, a)
     return result
 
 
@@ -897,8 +899,14 @@ def _ocr_try_table_row_for_aliases(
     parts = [p.strip() for p in parts if p.strip()]
     if len(parts) < 2:
         return None, None
-    head = re.sub(r"\s+", " ", parts[0].lower())
-    if not any(a in head for a in aliases):
+    head_norm = parts[0].strip()
+    head = re.sub(r"\s+", " ", head_norm.lower())
+    matched = False
+    for al in sorted(aliases, key=len, reverse=True):
+        if _cy_alias_search(head, al):
+            matched = True
+            break
+    if not matched:
         return None, None
     nums: list[float] = []
     for cell in parts[1:]:
@@ -986,6 +994,8 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
                     "campaignperuser",
                     "campaign p user",
                     "campaign p. user",
+                    "campaign for user",
+                    "camp per user",
                     "cmp per user",
                     "cpu",
                     "сampaign per user",
@@ -993,9 +1003,17 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
                 ]
             )
         elif dk == "new_campaign_cnt":
-            extra.extend(["new campaign cnt", "new campaign", "campaign cnt", "newcampaign"])
+            extra.extend(
+                [
+                    "new campaign cnt",
+                    "new campaign",
+                    "campaign cnt",
+                    "newcampaign",
+                    "new campaign count",
+                ]
+            )
         elif dk == "price_per_day":
-            extra.extend(["price per day", "priceperday", "ppd"])
+            extra.extend(["price per day", "priceperday", "ppd", "price/day"])
         elif dk == "arp_p_campaign":
             extra.extend(
                 [
@@ -1003,7 +1021,8 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
                     "arppcampaing",
                     "arp pcampaign",
                     "arpp campaign",
-                    "arpp",
+                    "arppu campaign",
+                    "arppucampaign",
                 ]
             )
         elif dk == "spending":
@@ -1026,7 +1045,13 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
             extra.extend(["fact imp per campaign", "fact imp", "factimpercampaign"])
         elif dk == "pct_execution_inventory":
             extra.extend(
-                ["%execution inventory", "execution inventory", "pct execution inventory"]
+                [
+                    "%execution inventory",
+                    "% execution inventory",
+                    "execution inventory",
+                    "pct execution inventory",
+                    "%exec inventory",
+                ]
             )
         elif dk == "active_listers":
             extra.extend(
@@ -1090,40 +1115,27 @@ def _cy_repair_pct_execution_if_dup_active(
                 continue
             if _cy_try_set_metric(result, dk_pe, b, a):
                 return
-    rows = _cy_collect_pp_numeric_rows(left)
-    if len(rows) < 11:
-        return
-    b10, a10 = rows[10]
-    typ = _CY_DK_TYPE[dk_pe]
-    if not _cy_pair_equal(b10, a10, ab, aa) and _cy_pair_semantically_plausible(
-        dk_pe, typ, b10, a10
-    ):
-        _cy_try_set_metric(result, dk_pe, b10, a10)
 
 
 def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | None]]:
     """
     Map OCR text to {data_key: {"before": float|None, "after": float|None}}.
-    Matching by metric name only (no category_id).
+    Anchor-based only: each metric is taken from the line whose label (text before the first digit)
+    matches an alias. Pipe/tab rows are tried first; free-form lines use the same anchors.
+    No positional zip across the table when a label is missing.
     """
     aliases = _get_ocr_cy_aliases()
     result: dict[str, dict[str, float | None]] = {
         dk: {"before": None, "after": None} for dk, _, _ in _CY_INPUT_METRICS
     }
     left = _ocr_left_panel_pp_only(text)
-    pp = _parse_pp_dashboard_metric_rows(left, aliases, [dk for dk, _, _ in _CY_INPUT_METRICS])
-    for dk in result:
-        p = pp.get(dk) or {}
-        if p.get("before") is not None and p.get("after") is not None:
-            result[dk] = {"before": p["before"], "after": p["after"]}
-
     lines = [ln.strip() for ln in left.splitlines() if ln.strip()]
     ordered_keys = sorted(
         aliases.keys(),
         key=lambda k: max(len(s) for s in aliases[k]),
         reverse=True,
     )
-    # Pass 0: pipe/tab table rows (Metric | Before | After)
+    # Pass 0: explicit pipe/tab rows (Metric | Before | After)
     for line in lines:
         for dk in ordered_keys:
             if result[dk]["before"] is not None and result[dk]["after"] is not None:
@@ -1131,40 +1143,17 @@ def _parse_cy_metrics_from_ocr_text(text: str) -> dict[str, dict[str, float | No
             b, a = _ocr_try_table_row_for_aliases(line, aliases[dk])
             if b is not None and a is not None:
                 _cy_try_set_metric(result, dk, b, a)
-    # Pass 1: same line, then 2-line window (avoid huge multi-line windows)
-    for i, line in enumerate(lines):
-        ll = line.lower()
-        win2 = "\n".join(lines[i : min(i + 2, len(lines))])
-        for dk in ordered_keys:
-            if result[dk]["before"] is not None and result[dk]["after"] is not None:
-                continue
-            if not any(a in ll for a in aliases[dk]):
-                continue
-            b, a = _try_before_after_pair_from_window(line)
-            if b is None or a is None:
-                b, a = _try_before_after_pair_from_window(win2)
-            if b is not None and a is not None and _cy_try_set_metric(result, dk, b, a):
-                break
-    # Pass 2: short slice after metric in flattened text (limit cross-row bleed)
-    flat = " " + _ocr_flat_text(left).lower() + " "
-    for dk in ordered_keys:
-        if result[dk]["before"] is not None and result[dk]["after"] is not None:
-            continue
-        best = -1
-        for a in sorted(aliases[dk], key=len, reverse=True):
-            pos = flat.find(" " + a + " ")
-            if pos < 0:
-                pos = flat.find(a)
-            if pos >= 0 and (best < 0 or pos < best):
-                best = pos
-        if best < 0:
-            continue
-        window = flat[best : min(len(flat), best + 220)]
-        b, a = _try_before_after_pair_from_window(window)
-        if b is not None and a is not None:
-            _cy_try_set_metric(result, dk, b, a)
 
-    _cy_fill_from_row_order_if_empty(left, result)
+    pp = _parse_pp_dashboard_metric_rows(left, aliases, [dk for dk, _, _ in _CY_INPUT_METRICS])
+    for dk, _, _ in _CY_INPUT_METRICS:
+        p = pp.get(dk) or {}
+        pb, pa = p.get("before"), p.get("after")
+        if pb is not None and pa is not None:
+            try:
+                _cy_try_set_metric(result, dk, float(pb), float(pa))
+            except (TypeError, ValueError):
+                continue
+
     _cy_repair_pct_execution_if_dup_active(result, left, aliases)
     # Second "Period Group" block is often Active listers; full text avoids losing it after left-panel crop.
     _al_pair = result.get("active_listers") or {}
@@ -1365,33 +1354,33 @@ def _cy_pair_semantically_plausible(dk: str, typ: str, b, a) -> bool:
         bf, af = float(b), float(a)
     except (TypeError, ValueError):
         return False
-    if bf < 0 or af < 0:
+    if dk != "pct_execution_inventory" and (bf < 0 or af < 0):
         return False
-    mx = max(bf, af)
+    abs_mx = max(abs(bf), abs(af))
     if dk == "campaign_per_user":
-        if mx > 500.0:
+        if abs_mx > 500.0:
             return False
-        tol = max(1e-5 * mx, 0.004)
+        tol = max(1e-5 * abs_mx, 0.004)
         intish_bf = abs(bf - round(bf)) < tol
         intish_af = abs(af - round(af)) < tol
-        if intish_bf and intish_af and mx >= 8.0:
+        if intish_bf and intish_af and abs_mx >= 8.0:
             return False
         return True
     if dk in ("plan_imp_per_campaign", "fact_imp_per_campaign"):
-        return mx <= 500_000.0
+        return abs_mx <= 500_000.0
     if dk == "price_per_day":
-        return mx <= 1_000_000.0
+        return abs_mx <= 1_000_000.0
     if dk in ("paid_users", "new_campaign_cnt", "active_listers"):
-        return mx <= 10**12
+        return abs_mx <= 10**12
     if dk in ("spending", "refund"):
-        return mx <= 10**15
+        return abs_mx <= 10**15
     if dk == "arp_p_campaign":
-        return mx <= 10**7
+        return abs_mx <= 10**7
     if dk == "pct_execution_inventory":
-        return mx <= 3500
+        return abs_mx <= 3500
     if "pct_" in dk:
-        return mx <= 10**6
-    return mx <= 10**18
+        return abs_mx <= 10**6
+    return abs_mx <= 10**18
 
 
 def _cy_plausible_pair_count(parsed: dict[str, dict[str, float | None]]) -> int:
