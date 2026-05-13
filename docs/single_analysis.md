@@ -14,7 +14,7 @@ Single режим активен, когда в текущих данных ре
 
 ## Ввод текущего года и Previous Year в UI
 
-- **Current Year**: number_input / OCR вкладки — значения читаются в переменные **`paid_users_before/after`**, **`spending_*`**, **`active_before/after`**.  
+- **Current Year**: number_input / OCR вкладки — значения читаются в переменные **`paid_users_before/after`**, **`spending_*`**, **`active_before/after`**. Разбор OCR: именованные строки и якоря; при «голых» числовых строках Period Group без подписей метрик — позиционный fallback (см. [ui_ux_rules.md](ui_ux_rules.md), OCR).
 - **Previous Year** — expander **`Previous Year (...)`**: **`matrix_py_*`** поля чисел; для сценария **New category** подсказано, что PY не используется.
 
 ## PPV matrix (analytics)
@@ -30,7 +30,11 @@ Single режим активен, когда в текущих данных ре
 
 ## Potential Spendings
 
-Правая колонка у матрицы: **`_compute_potential_spendings_block`** + таблица. Для **New category** или **Previous Year anomaly** PY‑часть **опускается** (`omit_py` / `omit_py_dependent_row`).
+Данные считаются в **`_compute_potential_spendings_block`**; отображение — **`_render_analytics_potential_block`** (заголовок **Potential Spendings**, капшн по сценарию).
+
+- **New category** или **Previous Year anomaly**: PY‑зависимая часть опускается (`omit_py` / `omit_py_dependent_row` — строка Spendings или поля Could be / diff / diff % могут быть **—**).
+- **Single** (`_category_single_mode`): вместо таблицы — **KPI‑карточки** (**`_render_potential_spendings_kpi_cards`**).
+- **Рядом с PPV matrix** (не single): компактная **таблица** `st.dataframe` с **фиксированными ширинами столбцов в пикселях** и фиксированной шириной виджета (**`_potential_spendings_table_dataframe_kwargs`**), стилизация **`diff %`** через **`_potential_spendings_style_table`**. Подробности — [ui_ux_rules.md](ui_ux_rules.md) (раздел Potential Spendings).
 
 ## Кнопка Calculate
 

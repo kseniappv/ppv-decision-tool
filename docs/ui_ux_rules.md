@@ -42,6 +42,25 @@
 
 Более развёрнутая **Summary** секция (**`_bulk_render_summary`**) с expanders сохранена отдельно.
 
+## Potential Spendings (аналитика)
+
+Рендер: **`_render_analytics_potential_block`** (`app.py`).
+
+| Режим | Вид |
+|-------|-----|
+| **Single** (`_category_single_mode`) | Компактные карточки **`_render_potential_spendings_kpi_cards`** (таблица не используется). |
+| **Не single** (матрица + правая колонка) | **`st.dataframe`** с **`_potential_spendings_style_table`**: строки **ARPpU** и **Spendings**, колонки Fact / Could be / diff / diff %. |
+
+**Таблица (не single):**
+
+- **`_potential_spendings_table_dataframe_kwargs`**: у **`TextColumn`** заданы **целочисленные ширины в px** (фиксированная сетка Glide, без ручного поджатия столбцов); **`use_container_width=False`**; у **`st.dataframe`** передаётся **`width`** ≈ сумма ширин колонок + небольшой запас под рамку.
+- Глобальный стиль **`[data-testid="stDataFrame"]`**: **`overflow-x: auto`**, чтобы при узкой колонке аналитики таблицу можно было **прокрутить по горизонтали**, а не обрезать молча.
+
+**Колонка `diff %` (и согласованные бейджи в KPI):**
+
+- Семантика ↑ / ↓ / = без изменений; фон ячеек — полупрозрачный tint (зелёный / красный / жёлтый).
+- Текст и бейджи — **повышенный контраст** и **`font-weight: 700`** (**`_potential_spendings_diff_pct_cell_css`**, **`_potential_spendings_diff_pct_badge_md`**), чтобы проценты читались на тёмной теме.
+
 ## Форматирование Result / процентов
 
 Используется **`number_format.py`**: **`format_percent`**, **`format_matrix_metric`**, **`format_integer`** (например group thousands для **`category_id`** в табличном отображении).
@@ -73,3 +92,5 @@
 ## OCR / merge подсказки
 
 В нескольких местах UI есть защита от случайной перезаписи session state после смены категории / re-upload — см. комментарии в **`app.py`** (не дублируются здесь дословно).
+
+**Current Year OCR — позиционный fallback:** если OCR отдаёт блок **Period Group** с числами **без имён метрик в строках**, и обычный разбор по якорям/pipe ещё **не заполнил** ни одну метрику Before/After, срабатывает **`_cy_maybe_ordered_numeric_fallback`**: строки блока (после **`_cy_primary_period_group_metric_lines`**, которая останавливается на **втором** заголовке «period group» и пропускает строки без цифр вроде **Default Target**) сопоставляются с метриками **`_CY_INPUT_METRICS`** **по порядку строки**. Парсинг пар **Before|After** — **`_pp_order_row_numeric_pair`** (в т.ч. «битые» строки с лишними символами).
