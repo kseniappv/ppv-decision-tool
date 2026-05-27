@@ -33,6 +33,7 @@ from ppv_data_loader import (
     load_and_merge_spending_active,
     pct_change_relative,
 )
+from clickhouse_loader import load_from_clickhouse, COUNTRY_ID_MAP as _CH_COUNTRY_MAP
 
 _LAYOUT_COMPACT_CSS = """
 <style>
@@ -2358,7 +2359,7 @@ with st.container():
                 _render_ocr_upload_section(_category_bulk_mode)
 
         with _ic_cy:
-            with st.expander("Current Year files", expanded=True):
+            with st.expander("Current Year files", expanded=False):
                 spending_file = st.file_uploader("New PPV (spending)", type=["xlsx", "csv"])
                 _uf1, _uf2 = st.columns(2)
                 with _uf1:
@@ -2399,11 +2400,10 @@ with st.container():
                 key="ppv_geo_select",
             )
         with _tb_cat:
-            category_input = st.text_area(
+            category_input = st.text_input(
                 "Category ID",
-                height=60,
                 key="ppv_category_ids_textarea",
-                placeholder="ID или несколько для bulk (запятая / новая строка)",
+                placeholder="ID или несколько для bulk (через запятую)",
             )
             _bulk_pick_ids: list[int] = []
             if _merged_for_toolbar and len(_merged_for_toolbar) > 1:
@@ -2461,9 +2461,98 @@ with st.container():
     _bulk_from_pick_ic = len(_bulk_pick_ids) > 1
     _category_bulk_mode = _bulk_from_text_ic or _bulk_from_pick_ic
 
+    # ------------------------------------------------------------------
+    # Загрузка из ClickHouse
+    # ------------------------------------------------------------------
+    with st.expander("Загрузка из ClickHouse", expanded=False):
+        st.caption(
+            "Данные тянутся из **analytics.purchases** и **analytics.enriched_distributed**. "
+            "GEO и Category ID берутся из блока **Настройки** выше."
+        )
+        _ch_c1, _ch_c2 = st.columns(2, gap="medium")
+        with _ch_c1:
+            st.markdown("**Период Before**")
+            _ch_b1, _ch_b2 = st.columns(2)
+            with _ch_b1:
+                _ch_before_from = st.date_input("От", key="ch_before_from", value=None)
+            with _ch_b2:
+                _ch_before_to = st.date_input("До", key="ch_before_to", value=None)
+        with _ch_c2:
+            st.markdown("**Период After**")
+            _ch_a1, _ch_a2 = st.columns(2)
+            with _ch_a1:
+                _ch_after_from = st.date_input("От", key="ch_after_from", value=None)
+            with _ch_a2:
+                _ch_after_to = st.date_input("До", key="ch_after_to", value=None)
+
+        _ch_ids = parsed_category_ids or [c for c in (_bulk_pick_ids or [])]
+        _ch_btn_disabled = not (_ch_ids and _ch_before_from and _ch_before_to and _ch_after_from and _ch_after_to)
+        _ch_load_col, _ch_clear_col = st.columns([3, 1])
+        with _ch_load_col:
+            _ch_load = st.button(
+                "Загрузить из ClickHouse",
+                disabled=_ch_btn_disabled,
+                type="primary",
+                use_container_width=True,
+                key="ch_load_btn",
+            )
+        with _ch_clear_col:
+            _ch_clear = st.button(
+                "Очистить",
+                disabled=not st.session_state.get("_ch_data_loaded"),
+                use_container_width=True,
+                key="ch_clear_btn",
+            )
+
+        if _ch_btn_disabled and not _ch_ids:
+            st.caption("Введите Category ID в блоке Настройки.")
+
+        if _ch_load:
+            with st.spinner("Загружаем данные из ClickHouse…"):
+                try:
+                    _ch_merged, _ch_price = load_from_clickhouse(
+                        category_ids=_ch_ids,
+                        geo=geo,
+                        before_from=_ch_before_from,
+                        before_to=_ch_before_to,
+                        after_from=_ch_after_from,
+                        after_to=_ch_after_to,
+                    )
+                    st.session_state["merged_data"] = _ch_merged
+                    st.session_state["price_data"] = _ch_price
+                    st.session_state["_ch_data_loaded"] = True
+                    st.session_state.pop("_upload_sig", None)
+                    if _ch_merged:
+                        st.success(f"Загружено {len(_ch_merged)} категорий.")
+                    else:
+                        st.warning("Данные не найдены — проверьте периоды и Category ID.")
+                    st.rerun()
+                except Exception as _ch_err:
+                    _err_str = str(_ch_err)
+                    if "timed out" in _err_str or "ConnectTimeout" in _err_str or "ConnectionError" in _err_str:
+                        st.error(
+                            "Не удалось подключиться к ClickHouse — сервер недоступен. "
+                            "Проверьте подключение к **VPN** и попробуйте снова."
+                        )
+                    else:
+                        st.error(f"Ошибка ClickHouse: {_ch_err}")
+
+        if _ch_clear:
+            st.session_state.pop("merged_data", None)
+            st.session_state.pop("price_data", None)
+            st.session_state.pop("_ch_data_loaded", None)
+            st.rerun()
+
+        if st.session_state.get("_ch_data_loaded"):
+            _ch_loaded_n = len(st.session_state.get("merged_data") or {})
+            st.info(f"Активен источник: **ClickHouse** — {_ch_loaded_n} категорий загружено.")
+
     merged_data = {}
     price_data = {}
-    if spending_file and active_file and price_file:
+    if st.session_state.get("_ch_data_loaded") and not (spending_file and active_file):
+        merged_data = st.session_state.get("merged_data") or {}
+        price_data = st.session_state.get("price_data") or {}
+    elif spending_file and active_file and price_file:
         upload_sig = (
             "cy3",
             getattr(spending_file, "name", "") or "",
@@ -2486,6 +2575,7 @@ with st.container():
                 st.session_state["price_data"] = price_data
                 st.session_state["_upload_sig"] = upload_sig
                 st.session_state["_merge_files_dirty"] = True
+                st.session_state.pop("_ch_data_loaded", None)
             finally:
                 for p in paths:
                     try:
@@ -2512,6 +2602,7 @@ with st.container():
                 st.session_state["price_data"] = {}
                 st.session_state["_upload_sig"] = upload_sig
                 st.session_state["_merge_files_dirty"] = True
+                st.session_state.pop("_ch_data_loaded", None)
             finally:
                 for p in paths:
                     try:
@@ -2519,10 +2610,11 @@ with st.container():
                     except OSError:
                         pass
     else:
-        st.session_state.pop("merged_data", None)
-        st.session_state.pop("price_data", None)
-        st.session_state.pop("_upload_sig", None)
-        st.session_state.pop("_merge_files_dirty", None)
+        if not st.session_state.get("_ch_data_loaded"):
+            st.session_state.pop("merged_data", None)
+            st.session_state.pop("price_data", None)
+            st.session_state.pop("_upload_sig", None)
+            st.session_state.pop("_merge_files_dirty", None)
 
     merged_data = st.session_state.get("merged_data") or {}
     price_data = st.session_state.get("price_data") or {}
@@ -3171,6 +3263,15 @@ def _bulk_render_summary(df: pd.DataFrame) -> None:
         _sx4.metric("Other", int((_su == "Other category").sum()))
         _sx5.metric("Low NPL auto", int((_su == "Low NPL auto").sum()))
         _sx6.metric("Low NPL (<10)", int((_su == "Low NPL (<10)").sum()))
+
+    m_cy_sp = _bulk_mean_numeric_column_mean(df, "cy_spending_diff")
+    m_y2y_cr = _bulk_mean_numeric_column_mean(df, "y2y_cr_diff")
+    if m_cy_sp is not None or m_y2y_cr is not None:
+        _ax1, _ax2 = st.columns(2)
+        with _ax1:
+            st.metric("Avg CY Spending %", format_percent(m_cy_sp) if m_cy_sp is not None else "—")
+        with _ax2:
+            st.metric("Avg Y2Y CR Δ", format_percent(m_y2y_cr) if m_y2y_cr is not None else "—")
 
     with st.expander("Разбивка по priority, final_decision, status", expanded=False):
         _e1, _e2, _e3 = st.columns(3)
@@ -3864,54 +3965,6 @@ def _bulk_mean_numeric_column_mean(df_: pd.DataFrame, col_name: str) -> float | 
     return float(series.mean())
 
 
-def _bulk_render_compact_dashboard(df: pd.DataFrame) -> None:
-    """Компактные KPI над таблицей — те же pri/scenario, что Summary (полный bulk_df)."""
-    if df is None or df.empty:
-        return
-    st.markdown("##### Overview")
-
-    pri_vc = df["priority"].value_counts()
-    dc = st.columns(5)
-    with dc[0]:
-        st.metric("Positive impact", int(pri_vc.get(_BULK_PRIORITY_POSITIVE, 0)))
-    with dc[1]:
-        st.metric("No impact", int(pri_vc.get(_BULK_PRIORITY_NO_IMPACT, 0)))
-    with dc[2]:
-        st.metric("Negative impact", int(pri_vc.get(_BULK_PRIORITY_NEGATIVE, 0)))
-    with dc[3]:
-        st.metric("Insufficient data", int(pri_vc.get(_BULK_PRIORITY_INSUFFICIENT, 0)))
-    with dc[4]:
-        st.metric("Missing CY", int(pri_vc.get(_BULK_PRIORITY_MISSING, 0)))
-
-    if "scenario_used" not in df.columns:
-        return
-    _su = df["scenario_used"]
-    sr = [
-        ("Regular", int((_su == "Regular").sum())),
-        ("New category", int((_su == "New category").sum())),
-        ("Previous Year anomaly", int((_su == "Previous Year anomaly").sum())),
-        ("Other category", int((_su == "Other category").sum())),
-        ("Low NPL auto", int((_su == "Low NPL auto").sum())),
-        ("Low NPL (<10)", int((_su == "Low NPL (<10)").sum())),
-    ]
-    sx = st.columns(6)
-    for _i, (_title, _v) in enumerate(sr):
-        with sx[_i]:
-            st.metric(_title, _v)
-
-    m_cy_sp = _bulk_mean_numeric_column_mean(df, "cy_spending_diff")
-    m_y2y_cr = _bulk_mean_numeric_column_mean(df, "y2y_cr_diff")
-    if m_cy_sp is None and m_y2y_cr is None:
-        return
-    ex = st.columns(2)
-    with ex[0]:
-        cy_lbl = format_percent(m_cy_sp) if m_cy_sp is not None else "—"
-        st.metric("Avg CY Spending %", cy_lbl)
-    with ex[1]:
-        y2_lbl = format_percent(m_y2y_cr) if m_y2y_cr is not None else "—"
-        st.metric("Avg Y2Y CR Δ", y2_lbl)
-
-
 _BULK_DETAIL_ADDITIONAL_SPECS = (
     ("campaign_per_user", "Campaign per User", "float"),
     ("new_campaign_cnt", "New campaign cnt", "int"),
@@ -4422,46 +4475,118 @@ def _ppv_matrix_primary_period_label(matrix_result_focus: str) -> str:
 
 def _ppv_matrix_style_analytics(df: pd.DataFrame, matrix_result_focus: str):
     """
-    Primary-period rows: stronger accent + band; metric groups separated by top rule.
+    Primary-period rows: blue accent band. diff Y2Y rows: always bold + slate accent.
+    PY rows: subtle zebra. Metric groups separated by top rule.
     Result cells: pill semantic styling.
     """
     primary_period = _ppv_matrix_primary_period_label(matrix_result_focus)
-    primary_band = "background-color: rgba(59,130,246,0.16)"
-    primary_accent = (
-        "border-left: 9px solid #60a5fa; "
-        "box-shadow: inset 6px 0 0 rgba(59,130,246,0.12), inset 0 0 0 1px rgba(59,130,246,0.14)"
-    )
-    grp_rule = "border-top: 3px solid rgba(148,163,184,0.35)"
+
+    primary_bg    = "background-color: rgba(59,130,246,0.11)"
+    primary_left  = "border-left: 4px solid #3b82f6"
+    diff_bg       = "background-color: rgba(15,23,42,0.055)"
+    diff_left     = "border-left: 4px solid #94a3b8"
+    py_bg         = "background-color: rgba(241,245,249,0.75)"
+    grp_rule      = "border-top: 2px solid rgba(100,116,139,0.28)"
+
     metrics_col = df["Metric"].tolist()
-    n = len(metrics_col)
 
     def _row_styles(row):
-        styles = []
         try:
             ri = int(row.name)
         except (TypeError, ValueError):
             ri = metrics_col.index(row["Metric"]) if row["Metric"] in metrics_col else 0
+
+        period      = row["Period"]
+        is_diff     = period == "diff Y2Y"
+        is_primary  = period == primary_period
         group_start = ri > 0 and metrics_col[ri] != metrics_col[ri - 1]
-        primary = row["Period"] == primary_period
+
+        styles = []
         for col in df.columns:
             parts = []
             if group_start:
                 parts.append(grp_rule)
-            if primary:
-                parts.append(primary_accent)
-                parts.append("font-weight: 650")
+
+            if is_diff:
+                parts.append(diff_bg)
+                parts.append(diff_left)
+                parts.append("font-weight: 700")
+            elif is_primary:
+                parts.append(primary_bg)
+                parts.append(primary_left)
+                parts.append("font-weight: 600")
+            else:
+                parts.append(py_bg)
+
             if col == "Result":
                 sem = _matrix_result_semantic_css(row[col])
                 if sem:
+                    parts = [p for p in parts if "background-color" not in p]
                     parts.append(sem)
-                elif primary:
-                    parts.append(primary_band)
-            elif primary:
-                parts.append(primary_band)
+
             styles.append("; ".join(parts) + ";" if parts else "")
         return styles
 
     return df.style.apply(_row_styles, axis=1)
+
+
+def _ppv_matrix_render_html(df: pd.DataFrame, matrix_result_focus: str) -> None:
+    """Render PPV matrix as an HTML table with bold headers and full row styling."""
+    primary_period = _ppv_matrix_primary_period_label(matrix_result_focus)
+    metrics_col = df["Metric"].tolist()
+    cols = df.columns.tolist()
+
+    th_s = (
+        "font-weight:700;padding:10px 12px;"
+        "border-bottom:2px solid rgba(100,116,139,0.25);"
+        "text-align:left;font-size:0.83rem;color:#475569;white-space:nowrap;"
+    )
+    header_html = "".join(f'<th style="{th_s}">{c}</th>' for c in cols)
+
+    rows_html = []
+    for ri, (_, row) in enumerate(df.iterrows()):
+        period = str(row.get("Period", ""))
+        is_diff    = period == "diff Y2Y"
+        is_primary = period == primary_period
+        group_start = ri > 0 and metrics_col[ri] != metrics_col[ri - 1]
+
+        if is_diff:
+            row_bg, left_clr, fw = "rgba(15,23,42,0.055)", "#94a3b8", "700"
+        elif is_primary:
+            row_bg, left_clr, fw = "rgba(59,130,246,0.11)", "#3b82f6", "600"
+        else:
+            row_bg, left_clr, fw = "rgba(241,245,249,0.75)", "transparent", "400"
+
+        top = "border-top:2px solid rgba(100,116,139,0.28);" if group_start else ""
+        row_style = f"background:{row_bg};border-left:4px solid {left_clr};{top}"
+
+        cells = []
+        for col in cols:
+            raw = row[col]
+            val_str = (
+                str(raw)
+                if raw is not None and not (isinstance(raw, float) and pd.isna(raw))
+                else "—"
+            )
+            td_s = f"padding:10px 12px;font-weight:{fw};font-size:0.875rem;"
+            if col == "Result":
+                sem = _matrix_result_semantic_css(val_str)
+                content = f'<span style="{sem}">{val_str}</span>' if sem else val_str
+            else:
+                content = val_str
+            cells.append(f'<td style="{td_s}">{content}</td>')
+
+        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
+
+    html = (
+        '<div style="width:100%;overflow-x:auto;">'
+        '<table style="width:100%;border-collapse:collapse;border-radius:10px;'
+        'overflow:hidden;border:1px solid rgba(148,163,184,0.18);font-family:inherit;">'
+        f'<thead><tr style="background:rgba(248,250,252,0.95)">{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        "</table></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def _ppv_matrix_add_primary_fallback_column(df: pd.DataFrame, matrix_result_focus: str):
@@ -4585,10 +4710,91 @@ def _potential_spendings_diff_pct_cell_css(val) -> str:
 
 
 def _potential_spendings_style_table(df: pd.DataFrame):
+    row_bgs = [
+        "background-color: rgba(241,245,249,0.0)",
+        "background-color: rgba(241,245,249,0.75)",
+    ]
+    left_border = "border-left: 4px solid #94a3b8"
+
+    def _row_styles(row):
+        try:
+            ri = int(row.name)
+        except (TypeError, ValueError):
+            ri = 0
+        bg = row_bgs[ri % len(row_bgs)]
+        styles = []
+        for col in df.columns:
+            parts = [bg, left_border]
+            if col == "Potential Spendings":
+                parts.append("font-weight: 700")
+            if col == "diff %":
+                css = _potential_spendings_diff_pct_cell_css(row[col])
+                if css:
+                    parts = [p for p in parts if "background-color" not in p]
+                    parts.append(css)
+            styles.append("; ".join(parts) + ";")
+        return styles
+
     try:
-        return df.style.map(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
-    except AttributeError:
-        return df.style.applymap(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
+        return df.style.apply(_row_styles, axis=1)
+    except Exception:
+        try:
+            return df.style.map(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
+        except AttributeError:
+            return df.style.applymap(_potential_spendings_diff_pct_cell_css, subset=["diff %"])
+
+
+def _potential_spendings_render_html(df: pd.DataFrame) -> None:
+    """Render Potential Spendings as an HTML table with bold headers."""
+    cols = df.columns.tolist()
+
+    th_s = (
+        "font-weight:700;padding:10px 12px;"
+        "border-bottom:2px solid rgba(100,116,139,0.25);"
+        "text-align:left;font-size:0.83rem;color:#475569;white-space:nowrap;"
+    )
+    header_html = "".join(f'<th style="{th_s}">{c}</th>' for c in cols)
+
+    row_bgs = ["rgba(255,255,255,0.0)", "rgba(241,245,249,0.75)"]
+
+    rows_html = []
+    for ri, (_, row) in enumerate(df.iterrows()):
+        bg = row_bgs[ri % len(row_bgs)]
+        row_style = f"background:{bg};border-left:4px solid #94a3b8;"
+
+        cells = []
+        for col in cols:
+            raw = row[col]
+            val_str = (
+                str(raw)
+                if raw is not None and not (isinstance(raw, float) and pd.isna(raw))
+                else "—"
+            )
+            td_s = "padding:10px 12px;font-size:0.875rem;"
+            if col == "Potential Spendings":
+                td_s += "font-weight:700;"
+                content = val_str
+            elif col == "diff %":
+                badge = _potential_spendings_diff_pct_cell_css(val_str)
+                content = (
+                    f'<span style="{badge} padding:3px 8px;">{val_str}</span>'
+                    if badge else val_str
+                )
+            else:
+                content = val_str
+            cells.append(f'<td style="{td_s}">{content}</td>')
+
+        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
+
+    html = (
+        '<div style="width:100%;overflow-x:auto;">'
+        '<table style="width:100%;border-collapse:collapse;border-radius:10px;'
+        'overflow:hidden;border:1px solid rgba(148,163,184,0.18);font-family:inherit;">'
+        f'<thead><tr style="background:rgba(248,250,252,0.95)">{header_html}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        "</table></div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def _potential_spendings_table_dataframe_kwargs() -> dict:
@@ -4613,10 +4819,12 @@ def _potential_spendings_table_dataframe_kwargs() -> dict:
         if "hide_index" in sig:
             out["hide_index"] = True
         if "use_container_width" in sig:
-            out["use_container_width"] = False
-        if "width" in sig:
-            # Sum of column widths + grid chrome / padding (hide_index → no index col).
-            out["width"] = _w_metric + _w_fact + _w_could + _w_diff + _w_pct + 44
+            out["use_container_width"] = True
+        row_px = 44
+        if "height" in sig:
+            out["height"] = 56 + 3 * row_px + 12
+        if "row_height" in sig:
+            out["row_height"] = row_px
     except (TypeError, ValueError):
         return {}
     return out
@@ -4707,7 +4915,7 @@ def _dataframe_tall_height_kw(n_rows: int) -> dict:
         sig = inspect.signature(st.dataframe).parameters
         if "height" not in sig or not n_rows:
             return kw
-        row_px = 36
+        row_px = 44
         chrome = 56
         slack_rows = 1
         h = chrome + (int(n_rows) + slack_rows) * row_px + 12
@@ -4965,7 +5173,7 @@ st.divider()
 st.markdown('<p class="sd-h2 sd-h2-tight">Ручной ввод данных</p>', unsafe_allow_html=True)
 
 _cy_ba: dict[str, tuple[float, float]] = {}
-with st.expander("Ручной ввод данных · Current Year + Previous Year (матрица)", expanded=not bool(merged_data)):
+with st.expander("Ручной ввод данных · Current Year + Previous Year (матрица)", expanded=False):
     _manuel_cy, _manuel_py = st.columns([1.08, 0.94], gap="small")
     with _manuel_cy:
         with st.container(border=True):
@@ -5251,23 +5459,7 @@ def _render_analytics_potential_block(*, show_heading: bool = True) -> None:
     if _category_single_mode:
         _render_potential_spendings_kpi_cards(_pot_df)
     else:
-        _pkw = _potential_spendings_table_dataframe_kwargs()
-        try:
-            st.dataframe(
-                _potential_spendings_style_table(_pot_df),
-                **_pkw,
-            )
-        except TypeError:
-            st.dataframe(
-                _potential_spendings_style_table(_pot_df),
-                hide_index=True,
-                use_container_width=True,
-            )
-        except Exception:
-            try:
-                st.dataframe(_pot_df, **_pkw)
-            except TypeError:
-                st.dataframe(_pot_df, hide_index=True, use_container_width=True)
+        _potential_spendings_render_html(_pot_df)
 
 
 with st.container(border=bool(_category_single_mode)):
@@ -5297,22 +5489,7 @@ if _category_single_mode:
                 "PY anomaly: Y2Y и PY-зависимый Potential — исключены."
             )
         st.caption(_ppv_cap)
-        try:
-            _matrix_styled = _ppv_matrix_style_analytics(_matrix_df, _matrix_result_focus)
-            _mkw = {**_ppv_matrix_dataframe_kwargs(), **_matrix_h_kw}
-            try:
-                st.dataframe(_matrix_styled, **_mkw)
-            except TypeError:
-                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True, **_matrix_h_kw)
-        except Exception:
-            st.dataframe(
-                _ppv_matrix_add_primary_fallback_column(
-                    _matrix_df, _matrix_result_focus
-                ),
-                hide_index=True,
-                use_container_width=True,
-                **_matrix_h_kw,
-            )
+        _ppv_matrix_render_html(_matrix_df, _matrix_result_focus)
     with pot_col:
         st.markdown("##### Potential Spendings")
         _render_analytics_potential_block(show_heading=False)
@@ -5331,21 +5508,7 @@ else:
                 "PY anomaly: Y2Y and PY-dependent Potential are excluded."
             )
         st.caption(_ppv_cap_b)
-        try:
-            _matrix_styled = _ppv_matrix_style_analytics(_matrix_df, _matrix_result_focus)
-            try:
-                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True, **_matrix_h_kw)
-            except TypeError:
-                st.dataframe(_matrix_styled, hide_index=True, use_container_width=True)
-        except Exception:
-            st.dataframe(
-                _ppv_matrix_add_primary_fallback_column(
-                    _matrix_df, _matrix_result_focus
-                ),
-                hide_index=True,
-                use_container_width=True,
-                **_matrix_h_kw,
-            )
+        _ppv_matrix_render_html(_matrix_df, _matrix_result_focus)
     with mq_right:
         st.markdown("##### Potential Spendings")
         _render_analytics_potential_block(show_heading=False)
@@ -5691,7 +5854,6 @@ if _category_bulk_mode:
         st.caption(
             f"Showing {len(_filtered_bulk)} of {len(_bulk_df)} categories"
         )
-        _bulk_render_compact_dashboard(_bulk_df)
         if _filtered_bulk.empty and not _bulk_df.empty:
             st.warning(
                 "По выбранным фильтрам не осталось ни одной строки. "
