@@ -33,7 +33,7 @@ from ppv_data_loader import (
     load_and_merge_spending_active,
     pct_change_relative,
 )
-from clickhouse_loader import load_from_clickhouse, COUNTRY_ID_MAP as _CH_COUNTRY_MAP
+from clickhouse_loader import load_from_clickhouse, load_py_from_clickhouse, COUNTRY_ID_MAP as _CH_COUNTRY_MAP
 
 _LAYOUT_COMPACT_CSS = """
 <style>
@@ -294,6 +294,86 @@ def _scenario_is_other_category(scenario: str) -> bool:
 
 def _cy_sess_key(data_key: str) -> str:
     return "active" if data_key == "active_listers" else data_key
+
+
+def _bulk_lookup_merged_category(merged_data: dict, cid: int):
+    """Return merged bucket for cid; tolerate odd dict keys after load (same logic as bulk)."""
+    if not merged_data:
+        return None
+    ic = int(cid)
+    if ic in merged_data:
+        return merged_data[ic]
+    for k, v in merged_data.items():
+        try:
+            if int(k) == ic:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _bulk_merge_missing_cy_hint(
+    merged_data,
+    *,
+    ch_loaded: bool,
+    spending_present: bool,
+    active_present: bool,
+) -> str:
+    """Explain why CY merged_data is empty (partial uploads vs merge not attempted)."""
+    if merged_data:
+        return ""
+    if ch_loaded:
+        return (
+            " *(источник **ClickHouse**, но в merged_data нет строк под эти категории/период)*"
+        )
+    if not spending_present and not active_present:
+        return (
+            " *(Current Year merge **не выполнялся**: нет ни **New PPV (spending)**, ни **Active listers**)*"
+        )
+    if not spending_present:
+        return (
+            " *(Current Year merge **не выполнялся**: не загружен файл **New PPV (spending)** — "
+            "нужны **оба** файла для пересечения по category_id)*"
+        )
+    if not active_present:
+        return (
+            " *(Current Year merge **не выполнялся**: не загружен файл **Active listers** — "
+            "нужны **оба** файла)*"
+        )
+    return (
+        " *(merge выполнен, но **0 категорий** после пересечения spending и active — проверьте состав файлов)*"
+    )
+
+
+def _bulk_merge_missing_py_hint(
+    merged_previous,
+    *,
+    py_spending_present: bool,
+    py_active_present: bool,
+) -> str:
+    if merged_previous:
+        return ""
+    if not py_spending_present and not py_active_present:
+        return " *(Previous Year merge **не выполнялся**: нет ни spending-, ни Active listers–файла)*"
+    if not py_spending_present:
+        return (
+            " *(Previous Year merge **не выполнялся**: не загружен **Previous Year New PPV (spending)** — "
+            "нужны **оба** PY-файла)*"
+        )
+    if not py_active_present:
+        return (
+            " *(Previous Year merge **не выполнялся**: не загружен **Previous Year Active listers** — "
+            "нужны **оба** PY-файла)*"
+        )
+    return (
+        " *(PY merge выполнен, но **0 категорий** после пересечения — проверьте состав файлов)*"
+    )
+
+
+# Current Year manual inputs: OCR / merges may yield negatives for %-style metrics.
+_CY_FLOAT_INPUT_ALLOW_NEGATIVE = frozenset(
+    {"pct_execution_inventory", "pct_campaign_with_refund"}
+)
 
 
 def _parse_category_ids(text: str):
@@ -2371,6 +2451,14 @@ with st.container():
                     "**Price per day** опционален: без него используется тот же merge, что и для Previous Year "
                     "(только spending + active). Bulk-анализ price не использует."
                 )
+                _cy_h_s = spending_file is not None
+                _cy_h_a = active_file is not None
+                if (_cy_h_s ^ _cy_h_a) and not st.session_state.get("_ch_data_loaded"):
+                    st.warning(
+                        "Для merge Current Year нужны **оба** файла: **New PPV (spending)** и **Active listers**. "
+                        "С одним файлом приложение не строит `merged_data` — категории в bulk будут считаться отсутствующими.",
+                        icon="⚠️",
+                    )
 
         with _ic_py:
             with st.expander("Previous Year files", expanded=False):
@@ -2384,6 +2472,14 @@ with st.container():
                     type=["xlsx", "csv"],
                     key="py_active_uploader",
                 )
+                _py_h_s = py_spending_file is not None
+                _py_h_a = py_active_file is not None
+                if _py_h_s ^ _py_h_a:
+                    st.warning(
+                        "Для merge Previous Year нужны **оба** файла: **Previous Year New PPV (spending)** и "
+                        "**Previous Year Active listers**. Иначе PY-данные в bulk не появятся.",
+                        icon="⚠️",
+                    )
 
     _merged_for_toolbar = st.session_state.get("merged_data") or {}
     with st.container(border=True):
@@ -2466,7 +2562,7 @@ with st.container():
     # ------------------------------------------------------------------
     with st.expander("Загрузка из ClickHouse", expanded=False):
         st.caption(
-            "Данные тянутся из **analytics.purchases** и **analytics.enriched_distributed**. "
+            "Данные тянутся из **analytics_reports.spendings_distributed** и **analytics_reports.active_listers_and_listings_distributed**. "
             "GEO и Category ID берутся из блока **Настройки** выше."
         )
         _ch_c1, _ch_c2 = st.columns(2, gap="medium")
@@ -2510,7 +2606,8 @@ with st.container():
         if _ch_load:
             with st.spinner("Загружаем данные из ClickHouse…"):
                 try:
-                    _ch_merged, _ch_price = load_from_clickhouse(
+                    from dateutil.relativedelta import relativedelta
+                    _ch_merged, _ch_price, _ch_budget_dist = load_from_clickhouse(
                         category_ids=_ch_ids,
                         geo=geo,
                         before_from=_ch_before_from,
@@ -2520,10 +2617,33 @@ with st.container():
                     )
                     st.session_state["merged_data"] = _ch_merged
                     st.session_state["price_data"] = _ch_price
+                    st.session_state["budget_dist"] = _ch_budget_dist
                     st.session_state["_ch_data_loaded"] = True
+                    st.session_state["_merge_files_dirty"] = True
                     st.session_state.pop("_upload_sig", None)
+
+                    # Load Previous Year: same periods shifted -1 year
+                    _py_before_from = _ch_before_from - relativedelta(years=1)
+                    _py_before_to   = _ch_before_to   - relativedelta(years=1)
+                    _py_after_from  = _ch_after_from  - relativedelta(years=1)
+                    _py_after_to    = _ch_after_to    - relativedelta(years=1)
+                    _ch_merged_py = load_py_from_clickhouse(
+                        category_ids=_ch_ids,
+                        geo=geo,
+                        before_from=_py_before_from,
+                        before_to=_py_before_to,
+                        after_from=_py_after_from,
+                        after_to=_py_after_to,
+                    )
+                    st.session_state["merged_data_previous_year"] = _ch_merged_py
+                    st.session_state["_py_merge_dirty"] = True
+
                     if _ch_merged:
-                        st.success(f"Загружено {len(_ch_merged)} категорий.")
+                        st.success(
+                            f"Загружено {len(_ch_merged)} категорий. "
+                            f"PY период: {_py_before_from} – {_py_before_to} / "
+                            f"{_py_after_from} – {_py_after_to}"
+                        )
                     else:
                         st.warning("Данные не найдены — проверьте периоды и Category ID.")
                     st.rerun()
@@ -2540,7 +2660,9 @@ with st.container():
         if _ch_clear:
             st.session_state.pop("merged_data", None)
             st.session_state.pop("price_data", None)
+            st.session_state.pop("budget_dist", None)
             st.session_state.pop("_ch_data_loaded", None)
+            st.session_state.pop("merged_data_previous_year", None)
             st.rerun()
 
         if st.session_state.get("_ch_data_loaded"):
@@ -2549,9 +2671,11 @@ with st.container():
 
     merged_data = {}
     price_data = {}
+    budget_dist = {}
     if st.session_state.get("_ch_data_loaded") and not (spending_file and active_file):
         merged_data = st.session_state.get("merged_data") or {}
         price_data = st.session_state.get("price_data") or {}
+        budget_dist = st.session_state.get("budget_dist") or {}
     elif spending_file and active_file and price_file:
         upload_sig = (
             "cy3",
@@ -2643,7 +2767,7 @@ with st.container():
                         os.unlink(p)
                     except OSError:
                         pass
-    else:
+    elif not st.session_state.get("_ch_data_loaded"):
         st.session_state.pop("merged_data_previous_year", None)
         st.session_state.pop("_upload_sig_py", None)
         st.session_state.pop("_py_merge_dirty", None)
@@ -2913,22 +3037,6 @@ def _bulk_resolve_category_name(data: dict | None) -> str:
     return ""
 
 
-def _bulk_lookup_merged_category(merged_data: dict, cid: int):
-    """Return merged bucket for cid; tolerate non-int dict keys after load."""
-    if not merged_data:
-        return None
-    ic = int(cid)
-    if ic in merged_data:
-        return merged_data[ic]
-    for k, v in merged_data.items():
-        try:
-            if int(k) == ic:
-                return v
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
 # CY Diff % для доп. метрик spending: формула как у PPV matrix (_matrix_pct_diff); не участвует в decision_engine.
 _BULK_CY_EXTRA_DIFF_PCT_SPECS: tuple[tuple[str, str], ...] = (
     ("campaign_per_user", "CY Diff % Campaign per User"),
@@ -2943,19 +3051,47 @@ _BULK_CY_EXTRA_DIFF_PCT_SPECS: tuple[tuple[str, str], ...] = (
 )
 _BULK_CY_EXTRA_DIFF_COLUMN_NAMES = tuple(c for _, c in _BULK_CY_EXTRA_DIFF_PCT_SPECS)
 
+# (metric_key, human label, kind) — for absolute Before/After columns in CSV export.
+_BULK_CY_EXTRA_ABS_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("campaign_per_user",       "Campaign per User",        "float"),
+    ("new_campaign_cnt",        "New campaign cnt",         "int"),
+    ("price_per_day",           "Price per day",            "float"),
+    ("arp_p_campaign",          "ARPpCampaign",             "float"),
+    ("refund",                  "Refund",                   "float"),
+    ("pct_campaign_with_refund","%Campaign with refund",    "float"),
+    ("plan_imp_per_campaign",   "Plan Imp per Campaign",    "float"),
+    ("fact_imp_per_campaign",   "Fact Imp per Campaign",    "float"),
+    ("pct_execution_inventory", "%Execution Inventory",     "float"),
+)
+_BULK_CY_EXTRA_BEFORE_COLUMN_NAMES = tuple(f"cy_{mk}_before" for mk, _, _ in _BULK_CY_EXTRA_ABS_SPECS)
+_BULK_CY_EXTRA_AFTER_COLUMN_NAMES  = tuple(f"cy_{mk}_after"  for mk, _, _ in _BULK_CY_EXTRA_ABS_SPECS)
+
 
 def _bulk_na_extra_cy_diff_pct() -> dict[str, None]:
-    return dict.fromkeys(_BULK_CY_EXTRA_DIFF_COLUMN_NAMES, None)
+    d = dict.fromkeys(_BULK_CY_EXTRA_DIFF_COLUMN_NAMES, None)
+    d.update(dict.fromkeys(_BULK_CY_EXTRA_BEFORE_COLUMN_NAMES, None))
+    d.update(dict.fromkeys(_BULK_CY_EXTRA_AFTER_COLUMN_NAMES, None))
+    return d
 
 
 def _bulk_extra_cy_diff_pct_from_buckets(before_bucket, after_bucket) -> dict:
-    """(after−before)/before×100 или None как в матрице."""
+    """(after−before)/before×100 + absolute Before/After для доп. метрик."""
     b = before_bucket or {}
     a = after_bucket or {}
-    return {
+    result = {
         cname: _matrix_pct_diff(b.get(mkey), a.get(mkey))
         for mkey, cname in _BULK_CY_EXTRA_DIFF_PCT_SPECS
     }
+    for mkey, _, kind in _BULK_CY_EXTRA_ABS_SPECS:
+        v_b = b.get(mkey)
+        v_a = a.get(mkey)
+        if kind == "int":
+            result[f"cy_{mkey}_before"] = int(float(v_b)) if v_b is not None else None
+            result[f"cy_{mkey}_after"]  = int(float(v_a)) if v_a is not None else None
+        else:
+            result[f"cy_{mkey}_before"] = round(float(v_b), 4) if v_b is not None else None
+            result[f"cy_{mkey}_after"]  = round(float(v_a), 4) if v_a is not None else None
+    return result
 
 
 def _bulk_analysis_dataframe(
@@ -3002,15 +3138,25 @@ def _bulk_analysis_dataframe(
                         _st, su_miss, has_py=_has_py
                     ),
                     "status": _st,
+                    "cy_paid_users_before": None,
+                    "cy_paid_users_after": None,
                     "cy_paid_users_diff": None,
+                    "cy_spending_before": None,
+                    "cy_spending_after": None,
                     "cy_spending_diff": None,
                     "cy_cr_diff": None,
+                    "cy_active_listers_before": None,
+                    "cy_active_listers_after": None,
                     "cy_active_listers_diff": None,
                     **_bulk_na_extra_cy_diff_pct(),
                     "decision_code": None,
                     "final_decision": None,
                     "next_step": None,
+                    "py_paid_users_before": None,
+                    "py_paid_users_after": None,
                     "py_paid_users_diff": None,
+                    "py_spending_before": None,
+                    "py_spending_after": None,
                     "py_spending_diff": None,
                     "py_cr_diff": None,
                     "py_active_listers_diff": None,
@@ -3047,6 +3193,18 @@ def _bulk_analysis_dataframe(
         pd_py = None
         if not row_is_new and merged_data_previous_year:
             pd_py = _bulk_lookup_merged_category(merged_data_previous_year, cid)
+
+        # Auto-case 1: no PY data and no manual override → New category
+        _auto_eligible = (
+            int(cid) not in other_eff
+            and int(cid) not in new_eff
+            and int(cid) not in py_eff
+            and not row_force_low
+        )
+        if _auto_eligible and not row_is_new and not row_is_py_anom and not row_is_other and pd_py is None:
+            scenario_used = "New category"
+            row_is_new = True
+            row_is_py_anom = False
 
         py_paid_users_diff = None
         py_spending_diff = None
@@ -3142,10 +3300,18 @@ def _bulk_analysis_dataframe(
                     disp_fd = result["final_decision"]
                     disp_ns = result["next_step"]
             else:
-                y2y_decision_unavail = True
-                disp_dc = "—"
-                disp_fd = "Insufficient data"
-                disp_ns = _BULK_Y2Y_DECISION_UNAVAILABLE_NEXT_STEP
+                # Auto-case 2: PY data exists but Y2Y can't be computed → Previous Year anomaly (CY decision)
+                if _auto_eligible and not row_is_py_anom and not row_is_other:
+                    scenario_used = "Previous Year anomaly"
+                    row_is_py_anom = True
+                    disp_dc = result["decision_code"]
+                    disp_fd = result["final_decision"]
+                    disp_ns = result["next_step"]
+                else:
+                    y2y_decision_unavail = True
+                    disp_dc = "—"
+                    disp_fd = "Insufficient data"
+                    disp_ns = _BULK_Y2Y_DECISION_UNAVAILABLE_NEXT_STEP
         else:
             y2y_decision_unavail = True
             disp_dc = "—"
@@ -3173,15 +3339,25 @@ def _bulk_analysis_dataframe(
                     low_npl_insufficient_sample=_low_npl_insufficient_flag,
                 ),
                 "status": _st_ok,
+                "cy_paid_users_before": npl_b,
+                "cy_paid_users_after": npl_a,
                 "cy_paid_users_diff": cy_paid_users_diff,
+                "cy_spending_before": round(sp_b, 2),
+                "cy_spending_after": round(sp_a, 2),
                 "cy_spending_diff": cy_spending_diff,
                 "cy_cr_diff": cy_cr,
+                "cy_active_listers_before": ac_b,
+                "cy_active_listers_after": ac_a,
                 "cy_active_listers_diff": cy_active_listers_diff,
                 **_bulk_extra_cy_diff_pct_from_buckets(b, a),
                 "decision_code": disp_dc,
                 "final_decision": disp_fd,
                 "next_step": disp_ns,
+                "py_paid_users_before": pnpl_b,
+                "py_paid_users_after": pnpl_a,
                 "py_paid_users_diff": py_paid_users_diff,
+                "py_spending_before": round(psp_py_b, 2) if psp_py_b is not None else None,
+                "py_spending_after": round(psp_py_a, 2) if psp_py_a is not None else None,
                 "py_spending_diff": py_spending_diff,
                 "py_cr_diff": py_cr_diff,
                 "py_active_listers_diff": py_active_listers_diff,
@@ -3197,12 +3373,24 @@ def _bulk_analysis_dataframe(
         "category_name",
         "scenario_used",
         "priority",
+        "cy_paid_users_before",
+        "cy_paid_users_after",
         "cy_paid_users_diff",
+        "cy_spending_before",
+        "cy_spending_after",
         "cy_spending_diff",
         "cy_cr_diff",
+        "cy_active_listers_before",
+        "cy_active_listers_after",
         "cy_active_listers_diff",
         *_BULK_CY_EXTRA_DIFF_COLUMN_NAMES,
+        *_BULK_CY_EXTRA_BEFORE_COLUMN_NAMES,
+        *_BULK_CY_EXTRA_AFTER_COLUMN_NAMES,
+        "py_paid_users_before",
+        "py_paid_users_after",
         "py_paid_users_diff",
+        "py_spending_before",
+        "py_spending_after",
         "py_spending_diff",
         "py_cr_diff",
         "py_active_listers_diff",
@@ -3217,10 +3405,240 @@ def _bulk_analysis_dataframe(
         "status",
     ]
     df = pd.DataFrame(rows, columns=cols)
+    df["group_type"]           = ""
+    df["parent_ref_id"]        = None
+    df["parent_category_name"] = ""
     df["_pri_sort"] = df["priority"].map(lambda p: _BULK_PRIORITY_SORT_ORDER.get(p, 99))
     df = df.sort_values(by=["_pri_sort", "category_id"], ascending=[True, True]).drop(
         columns=["_pri_sort"]
     )
+    return df
+
+
+# ── Parent-category fallback ────────────────────────────────────────────────
+
+_PARENT_THRESHOLD = 0.80   # fraction of children that must be Insufficient
+_PARENT_SCENARIO_LABEL = "Parent group"
+_PARENT_SCENARIO_CHILD = "By parent category"
+_BULK_ROW_BG_PARENT     = "#dbeafe"   # light blue for parent header rows
+_BULK_ROW_BG_CHILD_INH  = "#f1f5f9"  # light slate for inherited children
+
+
+def _bulk_detect_parent_groups(
+    bulk_df: pd.DataFrame,
+    child_to_parent: dict[int, int],
+    cat_names: dict[int, str],
+    threshold: float = _PARENT_THRESHOLD,
+) -> list[dict]:
+    """
+    Group insufficient-data categories by parent.
+    Returns list of {parent_id, parent_name, child_ids, all_child_ids}.
+    Only groups where ≥ threshold of siblings have Insufficient data are returned.
+    """
+    if bulk_df is None or bulk_df.empty or not child_to_parent:
+        return []
+
+    # Build parent→all_children mapping from the bulk_df category list
+    parent_to_children: dict[int, list[int]] = {}
+    for cid_raw in bulk_df["category_id"]:
+        try:
+            cid = int(cid_raw)
+        except (TypeError, ValueError):
+            continue
+        pid = child_to_parent.get(cid)
+        if pid is not None:
+            parent_to_children.setdefault(pid, []).append(cid)
+
+    insufficient_ids = frozenset(
+        int(r["category_id"])
+        for _, r in bulk_df.iterrows()
+        if str(r.get("final_decision") or "").strip() == "Insufficient data"
+    )
+
+    groups = []
+    for parent_id, all_children in parent_to_children.items():
+        if not all_children:
+            continue
+        insuff_children = [c for c in all_children if c in insufficient_ids]
+        ratio = len(insuff_children) / len(all_children)
+        if ratio < threshold:
+            continue
+        groups.append({
+            "parent_id":   parent_id,
+            "parent_name": cat_names.get(parent_id, str(parent_id)),
+            "child_ids":   insuff_children,    # children that had Insufficient
+            "all_child_ids": all_children,     # all children in bulk_df for this parent
+        })
+    return groups
+
+
+def _bulk_aggregate_children_buckets(
+    child_ids: list[int],
+    merged_data: dict,
+) -> tuple[dict, dict]:
+    """Aggregate before/after buckets from a list of child categories."""
+    agg_b: dict = {"paid_users": 0, "spending": 0.0, "active_listers": 0,
+                   "new_campaign_cnt": 0, "refund": 0.0}
+    agg_a: dict = {"paid_users": 0, "spending": 0.0, "active_listers": 0,
+                   "new_campaign_cnt": 0, "refund": 0.0}
+    for cid in child_ids:
+        data = _bulk_lookup_merged_category(merged_data, cid)
+        if not data:
+            continue
+        b = data.get("before") or {}
+        a = data.get("after") or {}
+        for key in ("active_listers", "new_campaign_cnt"):
+            agg_b[key] += int(float(b.get(key) or 0))
+            agg_a[key] += int(float(a.get(key) or 0))
+        agg_b["paid_users"] += int(float(b.get("paid_users") or 0))
+        agg_a["paid_users"] += int(float(a.get("paid_users") or 0))
+        agg_b["spending"]   += float(b.get("spending") or 0)
+        agg_a["spending"]   += float(a.get("spending") or 0)
+        agg_b["refund"]     += float(b.get("refund") or 0)
+        agg_a["refund"]     += float(a.get("refund") or 0)
+    return agg_b, agg_a
+
+
+def _bulk_analyze_parent_category(
+    parent_id: int,
+    parent_name: str,
+    all_child_ids: list[int],
+    merged_data: dict,
+    merged_data_py: dict,
+    geo: str,
+    scenario: str,
+) -> dict | None:
+    """
+    Aggregate children's data and run analysis at parent level.
+    No separate ClickHouse query needed — uses already-loaded merged_data.
+    Returns a result dict with decision/priority fields, or None if no data.
+    """
+    b, a = _bulk_aggregate_children_buckets(all_child_ids, merged_data)
+    npl_b = b["paid_users"]
+    npl_a = a["paid_users"]
+    sp_b  = b["spending"]
+    sp_a  = a["spending"]
+    ac_b  = b["active_listers"]
+    ac_a  = a["active_listers"]
+
+    if npl_b == 0 and npl_a == 0:
+        return None
+
+    pnpl_b = pnpl_a = psp_py_b = psp_py_a = pac_b = pac_a = None
+    py_paid_users_diff = py_spending_diff = py_cr_diff = py_active_listers_diff = None
+    py_has_data = False
+    if merged_data_py:
+        pb, pa = _bulk_aggregate_children_buckets(all_child_ids, merged_data_py)
+        if pb["paid_users"] > 0 or pa["paid_users"] > 0:
+            pnpl_b = pb["paid_users"]
+            pnpl_a = pa["paid_users"]
+            psp_py_b = pb["spending"]
+            psp_py_a = pa["spending"]
+            pac_b  = pb["active_listers"]
+            pac_a  = pa["active_listers"]
+            py_paid_users_diff = _engine_style_diff(pnpl_b, pnpl_a)
+            py_spending_diff   = _engine_style_diff(psp_py_b, psp_py_a)
+            pcr_b = _bulk_safe_ratio(pnpl_b, pac_b)
+            pcr_a = _bulk_safe_ratio(pnpl_a, pac_a)
+            py_cr_diff  = _engine_style_diff(pcr_b, pcr_a)
+            py_active_listers_diff = _engine_style_diff(pac_b, pac_a)
+            py_has_data = True
+
+    result = analyze_category(
+        npl_before=npl_b, npl_after=npl_a,
+        sp_before=sp_b,   sp_after=sp_a,
+        active_before=ac_b, active_after=ac_a,
+        geo=geo or "default",
+    )
+    cy_paid_users_diff     = result["npl_diff"]
+    cy_spending_diff       = result["sp_diff"]
+    cy_cr                  = result["cr_diff"]
+    cy_active_listers_diff = result["active_diff"]
+
+    disp_dc = result["decision_code"]
+    disp_fd = result["final_decision"]
+    disp_ns = result["next_step"]
+
+    if py_has_data:
+        y2y_bundle = _results_compute_y2y_npl_sp_cr_bundle(
+            geo or "default",
+            npl_b, npl_a, sp_b, sp_a, ac_b, ac_a,
+            pnpl_b, pnpl_a, psp_py_b, psp_py_a, pac_b, pac_a,
+        )
+        if y2y_bundle["complete"]:
+            disp_dc = y2y_bundle["decision_code"]
+            _dr = get_decision(disp_dc)
+            disp_fd = _dr["decision"]
+            disp_ns = _dr["next_step"]
+
+    def _y2y(cy_v, py_v):
+        if cy_v is None or py_v is None:
+            return None
+        return cy_v - py_v
+
+    return {
+        "decision_code": disp_dc,
+        "final_decision": disp_fd,
+        "next_step": disp_ns,
+        "priority": _bulk_row_priority("", disp_fd),
+        "cy_paid_users_diff": cy_paid_users_diff,
+        "cy_spending_diff":   cy_spending_diff,
+        "cy_cr_diff":         cy_cr,
+        "cy_active_listers_diff": cy_active_listers_diff,
+        "py_paid_users_diff": py_paid_users_diff,
+        "py_spending_diff":   py_spending_diff,
+        "py_cr_diff":         py_cr_diff,
+        "py_active_listers_diff": py_active_listers_diff,
+        "y2y_paid_users_diff":    _y2y(cy_paid_users_diff, py_paid_users_diff),
+        "y2y_spending_diff":      _y2y(cy_spending_diff, py_spending_diff),
+        "y2y_cr_diff":            _y2y(cy_cr, py_cr_diff),
+        "y2y_active_listers_diff": _y2y(cy_active_listers_diff, py_active_listers_diff),
+    }
+
+
+def _bulk_enrich_with_parents(
+    bulk_df: pd.DataFrame,
+    parent_groups: list[dict],
+    merged_data: dict,
+    merged_data_py: dict,
+    geo: str,
+    scenario: str,
+) -> pd.DataFrame:
+    """
+    For each qualifying parent group: run analysis on parent category data and
+    apply the parent's decision to insufficient child rows in-place.
+    Children keep their own metrics; only decision/priority/scenario_used change.
+    A 'parent_category_name' column is populated for children that inherited a decision.
+    """
+    if not parent_groups:
+        return bulk_df
+
+    df = bulk_df.copy()
+    if "parent_category_name" not in df.columns:
+        df["parent_category_name"] = ""
+
+    for grp in parent_groups:
+        pid           = grp["parent_id"]
+        pname         = grp["parent_name"]
+        child_ids     = grp["child_ids"]       # insufficient children — get decision updated
+        all_child_ids = grp["all_child_ids"]   # all children — used for aggregation
+
+        parent_row = _bulk_analyze_parent_category(
+            pid, pname, child_ids, merged_data, merged_data_py, geo, scenario
+        )
+        if parent_row is None:
+            continue
+
+        for cid in child_ids:
+            mask = df["category_id"].astype(str) == str(cid)
+            df.loc[mask, "group_type"]           = "child_inherited"
+            df.loc[mask, "parent_ref_id"]        = pid
+            df.loc[mask, "parent_category_name"] = pname
+            df.loc[mask, "scenario_used"]        = _PARENT_SCENARIO_CHILD
+            df.loc[mask, "final_decision"]       = parent_row["final_decision"]
+            df.loc[mask, "next_step"]            = parent_row["next_step"]
+            df.loc[mask, "priority"]             = parent_row["priority"]
+
     return df
 
 
@@ -3423,11 +3841,23 @@ def _bulk_render_insights(df: pd.DataFrame) -> None:
     st.markdown("\n\n".join(parts))
 
 
-_BULK_ROW_BG_MISSING_CY = "#e8e8e8"
-_BULK_ROW_BG_NEGATIVE = "#ffd6d6"
-_BULK_ROW_BG_INSUFFICIENT = "#fff3bf"
-_BULK_ROW_BG_POSITIVE = "#d3f9d8"
-_BULK_ROW_BG_NO_IMPACT = "#fff8e1"
+# Row-level backgrounds (very subtle — main visual signal comes from diff cells)
+_BULK_ROW_BG_MISSING_CY   = "#efefef"
+_BULK_ROW_BG_NEGATIVE     = "#fff0f0"
+_BULK_ROW_BG_INSUFFICIENT = "#fdfbef"
+_BULK_ROW_BG_POSITIVE     = "#f0fdf2"
+_BULK_ROW_BG_NO_IMPACT    = "#fdfbf0"
+
+# Per-cell diff coloring (value-based, stronger contrast than row tint)
+_BULK_DIFF_CELL_POSITIVE  = "rgba(40, 180, 90, 0.22)"   # green
+_BULK_DIFF_CELL_NEGATIVE  = "rgba(210, 50, 50, 0.20)"    # red
+_BULK_DIFF_CELL_NEAR_ZERO = "rgba(255, 190, 0, 0.18)"    # amber ≈ neutral
+
+# Decision cell badge colors
+_BULK_DECISION_BG_POSITIVE    = "rgba(40, 167, 69, 0.28)"
+_BULK_DECISION_BG_NEGATIVE    = "rgba(220, 53, 69, 0.28)"
+_BULK_DECISION_BG_NO_IMPACT   = "rgba(255, 193, 7, 0.28)"
+_BULK_DECISION_BG_INSUFFICIENT = "rgba(108, 117, 125, 0.20)"
 
 
 def _bulk_format_next_step_short(next_step: str) -> str:
@@ -3592,12 +4022,21 @@ def _bulk_styled_dataframe(df: pd.DataFrame, *, style_source: pd.DataFrame | Non
         return pd.Series([f"background-color: {bg}"] * len(row), index=row.index)
 
     def _cell_grid_styles(data):
-        # axis=None может передать ndarray; для стилизации опираемся на исходный df (та же форма и порядок).
+        # axis=None может передать ndarray; опираемся на исходный df.
         _ = data
         cols_ds = list(df.columns)
-        cy_first = next((c for c in cols_ds if c in _BULK_CY_METRIC_COLUMNS_SET), None)
-        py_first = next((c for c in cols_ds if c in _BULK_PY_METRIC_COLUMNS_SET), None)
+        cy_first  = next((c for c in cols_ds if c in _BULK_CY_METRIC_COLUMNS_SET), None)
+        py_first  = next((c for c in cols_ds if c in _BULK_PY_METRIC_COLUMNS_SET), None)
         y2y_first = next((c for c in cols_ds if c in _BULK_Y2Y_METRIC_COLUMNS_SET), None)
+
+        # All diff-type columns (value-based coloring)
+        all_diff_cols = frozenset(c for c in cols_ds if str(c).endswith("_diff"))
+        # Extra diff columns from spending metrics (column names already contain "CY Diff %")
+        extra_diff_cols = frozenset(
+            c for c in cols_ds if str(c).startswith("CY Diff %")
+        )
+        all_diff_all = all_diff_cols | extra_diff_cols
+
         out = pd.DataFrame("", index=df.index, columns=df.columns)
 
         for i_pos in range(len(df)):
@@ -3609,20 +4048,68 @@ def _bulk_styled_dataframe(df: pd.DataFrame, *, style_source: pd.DataFrame | Non
 
             for col in cols_ds:
                 parts: list[str] = []
-                if row_bg:
+                is_diff = col in all_diff_all
+
+                # 1. Subtle row background (just context, not the main signal)
+                if row_bg and not is_diff and col != "final_decision":
                     parts.append(f"background-color: {row_bg}")
-                if col in _BULK_CY_METRIC_COLUMNS_SET:
-                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_CY}")
-                elif col in _BULK_PY_METRIC_COLUMNS_SET:
-                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_PY}")
-                elif col in _BULK_Y2Y_METRIC_COLUMNS_SET:
-                    parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_Y2Y}")
+
+                # 2. Group tint — only for Before/After (non-diff) columns
+                if not is_diff and col != "final_decision":
+                    if col in _BULK_CY_METRIC_COLUMNS_SET:
+                        parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_CY}")
+                    elif col in _BULK_PY_METRIC_COLUMNS_SET:
+                        parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_PY}")
+                    elif col in _BULK_Y2Y_METRIC_COLUMNS_SET:
+                        parts.append(f"box-shadow: inset 0 0 0 100vmax {_BULK_GROUP_TINT_Y2Y}")
+
+                # 3. Diff-cell value-based coloring (main visual signal)
+                if is_diff:
+                    raw_val = mrow.get(col)
+                    try:
+                        v_f = float(raw_val)
+                        if v_f > 1.0:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_POSITIVE}")
+                        elif v_f < -1.0:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_NEGATIVE}")
+                        else:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_NEAR_ZERO}")
+                    except (TypeError, ValueError):
+                        pass
+
+                # 4. Decision badge — strong color on the cell
+                if col == "final_decision":
+                    fd = str(mrow.get("final_decision") or "")
+                    if fd == "Positive impact":
+                        parts = [
+                            f"background-color: {_BULK_DECISION_BG_POSITIVE}",
+                            "font-weight: 600",
+                        ]
+                    elif fd == "Negative impact":
+                        parts = [
+                            f"background-color: {_BULK_DECISION_BG_NEGATIVE}",
+                            "font-weight: 600",
+                        ]
+                    elif fd == "No impact":
+                        parts = [
+                            f"background-color: {_BULK_DECISION_BG_NO_IMPACT}",
+                            "font-weight: 600",
+                        ]
+                    elif fd == "Insufficient data":
+                        parts = [f"background-color: {_BULK_DECISION_BG_INSUFFICIENT}"]
+
+                # 5. Category name — bold
+                if col == "category_name":
+                    parts.append("font-weight: 600")
+
+                # 6. Group border-left markers
                 if col == cy_first:
                     parts.append(f"border-left: {_BULK_GROUP_BORDER_CY}")
                 elif col == py_first:
                     parts.append(f"border-left: {_BULK_GROUP_BORDER_PY}")
                 elif col == y2y_first:
                     parts.append(f"border-left: {_BULK_GROUP_BORDER_Y2Y}")
+
                 ji = cols_ds.index(col)
                 out.iat[i_pos, ji] = "; ".join(parts)
 
@@ -3707,9 +4194,10 @@ if merged_data and _category_single_mode:
     if sig != prev_cat and prev_cat != "":
         st.session_state.pop("_cy_ocr_override", None)
         st.session_state.pop("_cy_ocr_snapshot", None)
-    if category_id in merged_data:
+    cy_bucket = _bulk_lookup_merged_category(merged_data, category_id)
+    if cy_bucket is not None:
         if should_apply and not st.session_state.get("_cy_ocr_override"):
-            data = merged_data[category_id]
+            data = cy_bucket
             _bl = data.get("baseline") or {}
             for _dk, _, _dtyp in _CY_INPUT_METRICS:
                 sk = _cy_sess_key(_dk)
@@ -3746,9 +4234,10 @@ if (
     should_apply_py = sig_py != prev_cat_py or _merge_py_dirty
     if sig_py != prev_cat_py:
         st.session_state.pop("_py_ocr_override", None)
-    if category_id_py in merged_data_previous_year:
+    py_bucket = _bulk_lookup_merged_category(merged_data_previous_year, category_id_py)
+    if py_bucket is not None:
         if should_apply_py and not st.session_state.get("_py_ocr_override"):
-            pdata = merged_data_previous_year[category_id_py]
+            pdata = py_bucket
             st.session_state["matrix_py_paid_users_before"] = int(
                 float(pdata["before"].get("paid_users") or 0)
             )
@@ -3795,18 +4284,23 @@ if _category_bulk_mode:
     ]
     miss_cy = [i for i in _bulk_effective_category_ids if i not in in_cy]
     miss_py = [i for i in _bulk_effective_category_ids if i not in in_py]
+    _cy_suffix = _bulk_merge_missing_cy_hint(
+        merged_data,
+        ch_loaded=bool(st.session_state.get("_ch_data_loaded")),
+        spending_present=spending_file is not None,
+        active_present=active_file is not None,
+    )
+    _py_suffix = _bulk_merge_missing_py_hint(
+        merged_data_previous_year,
+        py_spending_present=py_spending_file is not None,
+        py_active_present=py_active_file is not None,
+    )
     st.markdown(
         f"- **Распознано валидных ID:** {n}\n"
-        f"- **Есть в Current Year data:** {len(in_cy)}"
-        + ("" if merged_data else " *(файлы Current Year не загружены — считаем все отсутствующими)*")
-        + f"\n- **Есть в Previous Year data:** {len(in_py)}"
-        + (
-            ""
-            if merged_data_previous_year
-            else " *(файлы Previous Year не загружены — считаем все отсутствующими)*"
-        )
-        + f"\n- **Не в Current Year data:** {miss_cy if miss_cy else '—'}"
-        + f"\n- **Не в Previous Year data:** {miss_py if miss_py else '—'}"
+        f"- **Есть в Current Year data:** {len(in_cy)}{_cy_suffix}\n"
+        f"- **Есть в Previous Year data:** {len(in_py)}{_py_suffix}\n"
+        f"- **Не в Current Year data:** {miss_cy if miss_cy else '—'}\n"
+        f"- **Не в Previous Year data:** {miss_py if miss_py else '—'}"
     )
 
 
@@ -3836,11 +4330,18 @@ _BULK_TABLE_DETAILS_CELL = "🔍"
 
 _BULK_SUMMARY_COLUMNS = (
     "category_id",
+    "parent_category_name",
     "category_name",
     "scenario_used",
+    "cy_paid_users_before",
+    "cy_paid_users_after",
     "cy_paid_users_diff",
+    "cy_spending_before",
+    "cy_spending_after",
     "cy_spending_diff",
     "cy_cr_diff",
+    "cy_active_listers_before",
+    "cy_active_listers_after",
     "cy_active_listers_diff",
     "py_paid_users_diff",
     "py_spending_diff",
@@ -3856,9 +4357,15 @@ _BULK_SUMMARY_COLUMNS = (
 
 # Колонки решений в compact‑таблице (для tint / border‑left; без доп. CY spending‑метрик из CSV).
 _BULK_CY_METRIC_COLUMNS = (
+    "cy_paid_users_before",
+    "cy_paid_users_after",
     "cy_paid_users_diff",
+    "cy_spending_before",
+    "cy_spending_after",
     "cy_spending_diff",
     "cy_cr_diff",
+    "cy_active_listers_before",
+    "cy_active_listers_after",
     "cy_active_listers_diff",
 )
 _BULK_PY_METRIC_COLUMNS = (
@@ -3888,13 +4395,20 @@ def _bulk_compact_column_ui_labels() -> dict[str, str]:
     """Человекочитаемые заголовки только для compact‑таблицы (CSV / полный bulk_df — internal имена)."""
     return {
         "category_id": "Category ID",
+        "parent_category_name": "Parent category",
         "category_name": "Category name",
         "scenario_used": "Scenario",
         "final_decision": "Decision",
         "next_step": "Next step",
+        "cy_paid_users_before": "CY Paid users Before",
+        "cy_paid_users_after": "CY Paid users After",
         "cy_paid_users_diff": "CY Paid users %",
+        "cy_spending_before": "CY Spending Before",
+        "cy_spending_after": "CY Spending After",
         "cy_spending_diff": "CY Spending %",
         "cy_cr_diff": "CY CR %",
+        "cy_active_listers_before": "CY Active listers Before",
+        "cy_active_listers_after": "CY Active listers After",
         "cy_active_listers_diff": "CY Active listers %",
         "py_paid_users_diff": "PY Paid users %",
         "py_spending_diff": "PY Spending %",
@@ -3994,15 +4508,305 @@ def _bulk_dataframe_selection_rows(event) -> list[int]:
         return []
 
 
+_BULK_CY_ABS_INT_COLS = frozenset({
+    "cy_paid_users_before", "cy_paid_users_after",
+    "cy_active_listers_before", "cy_active_listers_after",
+})
+_BULK_CY_ABS_FLOAT_COLS = frozenset({
+    "cy_spending_before", "cy_spending_after",
+})
+
+
 def _bulk_format_compact_diff_pct_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Колонки *\_diff как в матрице: format_percent."""
+    """Форматирует *_diff колонки (%) и абсолютные Before/After."""
     if df is None or df.empty:
         return df
     out = df.copy()
     for col in list(out.columns):
         if str(col).endswith("_diff"):
             out[col] = out[col].map(lambda v: format_percent(v))
+        elif col in _BULK_CY_ABS_INT_COLS:
+            out[col] = out[col].map(
+                lambda v: format_integer(int(v), group_thousands=True)
+                if v is not None and not (isinstance(v, float) and pd.isna(v))
+                else "—"
+            )
+        elif col in _BULK_CY_ABS_FLOAT_COLS:
+            out[col] = out[col].map(
+                lambda v: format_integer(int(round(v)), group_thousands=True)
+                if v is not None and not (isinstance(v, float) and pd.isna(v))
+                else "—"
+            )
     return out
+
+
+def _bulk_make_csv_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a clean, human-readable DataFrame for CSV export.
+    Key metrics (paid_users, spending, CR) get full Y2Y context.
+    Active listers gets CY only (per user spec).
+    """
+    def _fmt_pct(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        try:
+            return f"{float(v):+.1f}%"
+        except (TypeError, ValueError):
+            return ""
+
+    def _fmt_int(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        try:
+            return int(round(float(v)))
+        except (TypeError, ValueError):
+            return ""
+
+    def _fmt_float(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ""
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return ""
+
+    # Build extra-metrics column map dynamically from spec
+    _extra_col_map = []
+    _extra_int_cols: set = set()
+    _extra_float_cols: set = set()
+    _extra_pct_cols: set = set()
+    for mkey, label, kind in _BULK_CY_EXTRA_ABS_SPECS:
+        diff_col  = f"CY Diff % {label}"   # matches _BULK_CY_EXTRA_DIFF_PCT_SPECS cname
+        before_col = f"cy_{mkey}_before"
+        after_col  = f"cy_{mkey}_after"
+        _extra_col_map.append((before_col, f"CY {label} Before"))
+        _extra_col_map.append((after_col,  f"CY {label} After"))
+        _extra_col_map.append((diff_col,   f"CY {label} Diff %"))
+        _extra_pct_cols.add(diff_col)
+        if kind == "int":
+            _extra_int_cols.add(before_col)
+            _extra_int_cols.add(after_col)
+        else:
+            _extra_float_cols.add(before_col)
+            _extra_float_cols.add(after_col)
+
+    col_map = [
+        # Category info
+        ("category_id",            "Category ID"),
+        ("category_name",          "Category name"),
+        ("scenario_used",          "Scenario"),
+        ("final_decision",         "Decision"),
+        ("next_step",              "Next step"),
+        # CY Paid users
+        ("cy_paid_users_before",   "CY Paid users Before"),
+        ("cy_paid_users_after",    "CY Paid users After"),
+        ("cy_paid_users_diff",     "CY Paid users Diff %"),
+        # PY Paid users
+        ("py_paid_users_before",   "PY Paid users Before"),
+        ("py_paid_users_after",    "PY Paid users After"),
+        ("py_paid_users_diff",     "PY Paid users Diff %"),
+        # Y2Y Paid users
+        ("y2y_paid_users_diff",    "Y2Y Paid users Diff %"),
+        # CY Spending
+        ("cy_spending_before",     "CY Spending Before"),
+        ("cy_spending_after",      "CY Spending After"),
+        ("cy_spending_diff",       "CY Spending Diff %"),
+        # PY Spending
+        ("py_spending_before",     "PY Spending Before"),
+        ("py_spending_after",      "PY Spending After"),
+        ("py_spending_diff",       "PY Spending Diff %"),
+        # Y2Y Spending
+        ("y2y_spending_diff",      "Y2Y Spending Diff %"),
+        # CY/PY/Y2Y CR (no absolute values - it's a ratio)
+        ("cy_cr_diff",             "CY CR Diff %"),
+        ("py_cr_diff",             "PY CR Diff %"),
+        ("y2y_cr_diff",            "Y2Y CR Diff %"),
+        # Active listers — CY only
+        ("cy_active_listers_before", "CY Active listers Before"),
+        ("cy_active_listers_after",  "CY Active listers After"),
+        ("cy_active_listers_diff",   "CY Active listers Diff %"),
+        # Extra spending metrics — CY Before / After / Diff % only
+        *_extra_col_map,
+        # Warning flags (for transparency)
+        ("warning_flags",          "Warning flags"),
+    ]
+
+    _int_cols = {"cy_paid_users_before", "cy_paid_users_after",
+                 "cy_active_listers_before", "cy_active_listers_after",
+                 "py_paid_users_before", "py_paid_users_after"} | _extra_int_cols
+    _float_cols = {"cy_spending_before", "cy_spending_after",
+                   "py_spending_before", "py_spending_after"} | _extra_float_cols
+    _pct_cols = {
+        "cy_paid_users_diff", "py_paid_users_diff", "y2y_paid_users_diff",
+        "cy_spending_diff",   "py_spending_diff",   "y2y_spending_diff",
+        "cy_cr_diff",         "py_cr_diff",         "y2y_cr_diff",
+        "cy_active_listers_diff",
+    } | _extra_pct_cols
+
+    out_rows = []
+    for _, row in df.iterrows():
+        out_row = {}
+        for src_col, label in col_map:
+            if src_col not in df.columns:
+                out_row[label] = ""
+                continue
+            v = row.get(src_col)
+            if src_col in _pct_cols:
+                out_row[label] = _fmt_pct(v)
+            elif src_col in _int_cols:
+                out_row[label] = _fmt_int(v)
+            elif src_col in _float_cols:
+                out_row[label] = _fmt_float(v)
+            else:
+                out_row[label] = "" if (v is None or (isinstance(v, float) and pd.isna(v))) else v
+        out_rows.append(out_row)
+
+    return pd.DataFrame(out_rows, columns=[label for _, label in col_map])
+
+
+# ── Long-format CSV export ──────────────────────────────────────────────────
+# One row per (category × metric). Key metrics include PY/Y2Y columns;
+# additional metrics are CY-only.
+
+_LONG_METRIC_SPECS = (
+    # (label, cy_before_col, cy_after_col, cy_diff_col,
+    #  py_before_col, py_after_col, py_diff_col, y2y_diff_col, fmt_kind)
+    ("Paid users",
+     "cy_paid_users_before",          "cy_paid_users_after",
+     "cy_paid_users_diff",
+     "py_paid_users_before",          "py_paid_users_after",
+     "py_paid_users_diff",            "y2y_paid_users_diff",   "int"),
+    ("Spending",
+     "cy_spending_before",            "cy_spending_after",
+     "cy_spending_diff",
+     "py_spending_before",            "py_spending_after",
+     "py_spending_diff",              "y2y_spending_diff",     "float"),
+    ("CR",
+     None,                            None,
+     "cy_cr_diff",
+     None,                            None,
+     "py_cr_diff",                    "y2y_cr_diff",           "float"),
+    ("Active listers",
+     "cy_active_listers_before",      "cy_active_listers_after",
+     "cy_active_listers_diff",
+     None, None, None,                None,                    "int"),
+    ("Campaign per User",
+     "cy_campaign_per_user_before",   "cy_campaign_per_user_after",
+     "CY Diff % Campaign per User",
+     None, None, None,                None,                    "float"),
+    ("New campaign cnt",
+     "cy_new_campaign_cnt_before",    "cy_new_campaign_cnt_after",
+     "CY Diff % New campaign cnt",
+     None, None, None,                None,                    "int"),
+    ("Price per day",
+     "cy_price_per_day_before",       "cy_price_per_day_after",
+     "CY Diff % Price per day",
+     None, None, None,                None,                    "float"),
+    ("ARPpCampaign",
+     "cy_arp_p_campaign_before",      "cy_arp_p_campaign_after",
+     "CY Diff % ARPpCampaign",
+     None, None, None,                None,                    "float"),
+    ("Refund",
+     "cy_refund_before",              "cy_refund_after",
+     "CY Diff % Refund",
+     None, None, None,                None,                    "float"),
+    ("%Campaign with refund",
+     "cy_pct_campaign_with_refund_before", "cy_pct_campaign_with_refund_after",
+     "CY Diff % %Campaign with refund",
+     None, None, None,                None,                    "float"),
+    ("Plan Imp per Campaign",
+     "cy_plan_imp_per_campaign_before",   "cy_plan_imp_per_campaign_after",
+     "CY Diff % Plan Imp per Campaign",
+     None, None, None,                None,                    "float"),
+    ("Fact Imp per Campaign",
+     "cy_fact_imp_per_campaign_before",   "cy_fact_imp_per_campaign_after",
+     "CY Diff % Fact Imp per Campaign",
+     None, None, None,                None,                    "float"),
+    ("%Execution Inventory",
+     "cy_pct_execution_inventory_before", "cy_pct_execution_inventory_after",
+     "CY Diff % %Execution Inventory",
+     None, None, None,                None,                    "float"),
+)
+
+_LONG_OUTPUT_COLUMNS = [
+    "category_id", "category_name", "scenario", "decision", "next_step",
+    "metric",
+    "Before", "After", "Diff %",
+    "PY Before", "PY After", "PY Diff %", "Y2Y Diff %",
+]
+
+
+def _bulk_make_long_csv_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Long-format export: one row per (category × metric)."""
+
+    def _v(row, col):
+        if col is None or col not in df.columns:
+            return None
+        v = row.get(col)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return v
+
+    def _fmt_abs(v, kind):
+        if v is None:
+            return ""
+        try:
+            if kind == "int":
+                return int(round(float(v)))
+            return round(float(v), 4)
+        except (TypeError, ValueError):
+            return ""
+
+    def _fmt_diff(v):
+        if v is None:
+            return ""
+        try:
+            fv = float(v)
+            return f"{fv:+.1f}%"
+        except (TypeError, ValueError):
+            return ""
+
+    out_rows = []
+    for _, row in df.iterrows():
+        cat_id   = row.get("category_id", "")
+        cat_name = row.get("category_name", "")
+        scenario = row.get("scenario_used", "")
+        decision = row.get("final_decision", "")
+        next_stp = row.get("next_step", "")
+        if isinstance(next_stp, float) and pd.isna(next_stp):
+            next_stp = ""
+
+        for spec in _LONG_METRIC_SPECS:
+            (label,
+             cy_b_col, cy_a_col, cy_d_col,
+             py_b_col, py_a_col, py_d_col, y2y_d_col,
+             fmt) = spec
+
+            cy_b = _v(row, cy_b_col)
+            cy_a = _v(row, cy_a_col)
+            cy_d = _v(row, cy_d_col)
+            py_b = _v(row, py_b_col)
+            py_a = _v(row, py_a_col)
+            py_d = _v(row, py_d_col)
+            y2y  = _v(row, y2y_d_col)
+
+            out_rows.append({
+                "category_id":   cat_id,
+                "category_name": cat_name,
+                "scenario":      scenario,
+                "decision":      decision,
+                "next_step":     next_stp,
+                "metric":        label,
+                "Before":        _fmt_abs(cy_b, fmt),
+                "After":         _fmt_abs(cy_a, fmt),
+                "Diff %":        _fmt_diff(cy_d),
+                "PY Before":     _fmt_abs(py_b, fmt),
+                "PY After":      _fmt_abs(py_a, fmt),
+                "PY Diff %":     _fmt_diff(py_d),
+                "Y2Y Diff %":    _fmt_diff(y2y),
+            })
+
+    return pd.DataFrame(out_rows, columns=_LONG_OUTPUT_COLUMNS)
 
 
 def _bulk_cell_primary_bucket(val, *, kind: str) -> str:
@@ -4040,30 +4844,129 @@ def _bulk_cell_pct_bucket(val) -> str:
     return format_summary_percent_cell(fv)
 
 
-def _bulk_metrics_primary_detail_df(b, a):
-    """Paid users, Active, Spending, CR — те же типы чисел и Diff % что в PPV matrix."""
-    b = b or {}
-    a = a or {}
+def _parse_pct_val(s) -> float | None:
+    """Parse formatted percent string back to float (e.g. '-11.79%' → -11.79)."""
+    if s is None:
+        return None
+    try:
+        return float(str(s).replace("%", "").replace(",", ".").replace(" ", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _style_detail_metrics_table(df: pd.DataFrame) -> object:
+    """
+    Styling for Metrics details / Additional metrics drill-down tables:
+      - Diff % cells: green / red / amber by sign
+      - CY Before/After: blue tint; PY Before/After: grey tint; Y2Y: purple tint
+      - Group border-left at first column of each group
+      - Metric column: bold
+    """
+    if df is None or df.empty:
+        return df.style if hasattr(df, "style") else df
+
+    cols = list(df.columns)
+
+    _diff_cols    = frozenset(c for c in cols if "Diff %" in str(c))
+    _cy_abs       = frozenset(c for c in cols if str(c).startswith("CY ") and "Diff" not in str(c))
+    _py_abs       = frozenset(c for c in cols if str(c).startswith("PY ") and "Diff" not in str(c))
+    _y2y_non_diff = frozenset(c for c in cols if str(c).startswith("Y2Y") and "Diff" not in str(c))
+
+    cy_first  = next((c for c in cols if c in _cy_abs or "Diff" not in str(c) and str(c).startswith("CY")), None)
+    py_first  = next((c for c in cols if c in _py_abs), None) or \
+                next((c for c in cols if str(c).startswith("PY")), None)
+    y2y_first = next((c for c in cols if str(c).startswith("Y2Y")), None)
+
+    def _all_cells(data):
+        out = pd.DataFrame("", index=data.index, columns=data.columns)
+        for col in cols:
+            ji = cols.index(col)
+            border = ""
+            if col == cy_first:
+                border = f"border-left: {_BULK_GROUP_BORDER_CY}"
+            elif col == py_first:
+                border = f"border-left: {_BULK_GROUP_BORDER_PY}"
+            elif col == y2y_first:
+                border = f"border-left: {_BULK_GROUP_BORDER_Y2Y}"
+
+            for i_pos in range(len(data)):
+                v = data.iat[i_pos, ji]
+                parts: list[str] = []
+
+                if col == "Metric":
+                    parts.append("font-weight: 600")
+                elif col in _diff_cols:
+                    num = _parse_pct_val(v)
+                    if num is not None:
+                        if num > 1.0:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_POSITIVE}")
+                        elif num < -1.0:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_NEGATIVE}")
+                        else:
+                            parts.append(f"background-color: {_BULK_DIFF_CELL_NEAR_ZERO}")
+                elif col in _cy_abs:
+                    parts.append(f"background-color: {_BULK_GROUP_TINT_CY}")
+                elif col in _py_abs:
+                    parts.append(f"background-color: {_BULK_GROUP_TINT_PY}")
+                elif col in _y2y_non_diff:
+                    parts.append(f"background-color: {_BULK_GROUP_TINT_Y2Y}")
+
+                if border:
+                    parts.append(border)
+                out.iat[i_pos, ji] = "; ".join(parts)
+        return out
+
+    try:
+        sty = df.style.apply(_all_cells, axis=None)
+        try:
+            sty = sty.hide(axis="index")
+        except TypeError:
+            sty = sty.hide_index()
+        return sty
+    except Exception:
+        return df
+
+
+def _bulk_metrics_primary_detail_df(b, a, b_py=None, a_py=None):
+    """Paid users, Active, Spending, CR — CY + optional PY columns."""
+    b, a = b or {}, a or {}
+    b_py, a_py = b_py or {}, a_py or {}
+    has_py = bool(b_py or a_py)
+
     pn_b, pn_a = b.get("paid_users"), a.get("paid_users")
     ac_b, ac_a = b.get("active_listers"), a.get("active_listers")
     sp_b, sp_a = b.get("spending"), a.get("spending")
     cr_b = _matrix_safe_div(pn_b, ac_b)
     cr_a = _matrix_safe_div(pn_a, ac_a)
+
+    pn_pb, pn_pa = b_py.get("paid_users"), a_py.get("paid_users")
+    ac_pb, ac_pa = b_py.get("active_listers"), a_py.get("active_listers")
+    sp_pb, sp_pa = b_py.get("spending"), a_py.get("spending")
+    cr_pb = _matrix_safe_div(pn_pb, ac_pb)
+    cr_pa = _matrix_safe_div(pn_pa, ac_pa)
+
     rows_build = []
-    for label, bb, aa, bk in (
-        ("Paid users", pn_b, pn_a, "int"),
-        ("Active listers", ac_b, ac_a, "int"),
-        ("Spending", sp_b, sp_a, "float"),
-        ("CR", cr_b, cr_a, "float"),
+    for label, bb, aa, pb, pa, bk in (
+        ("Paid users",    pn_b, pn_a, pn_pb, pn_pa, "int"),
+        ("Active listers",ac_b, ac_a, ac_pb, ac_pa, "int"),
+        ("Spending",      sp_b, sp_a, sp_pb, sp_pa, "float"),
+        ("CR",            cr_b, cr_a, cr_pb, cr_pa, "float"),
     ):
-        rows_build.append(
-            {
-                "Metric": label,
-                "Before": _bulk_cell_primary_bucket(bb, kind=bk),
-                "After": _bulk_cell_primary_bucket(aa, kind=bk),
-                "Diff %": format_percent(_matrix_pct_diff(bb, aa)),
-            }
-        )
+        cy_diff = _matrix_pct_diff(bb, aa)
+        py_diff = _matrix_pct_diff(pb, pa) if has_py else None
+        y2y_diff = (cy_diff - py_diff) if (cy_diff is not None and py_diff is not None) else None
+        row = {
+            "Metric":    label,
+            "CY Before": _bulk_cell_primary_bucket(bb, kind=bk),
+            "CY After":  _bulk_cell_primary_bucket(aa, kind=bk),
+            "CY Diff %": format_percent(cy_diff),
+        }
+        if has_py:
+            row["PY Before"] = _bulk_cell_primary_bucket(pb, kind=bk)
+            row["PY After"]  = _bulk_cell_primary_bucket(pa, kind=bk)
+            row["PY Diff %"] = format_percent(py_diff)
+            row["Y2Y Diff %"] = format_percent(y2y_diff)
+        rows_build.append(row)
     return pd.DataFrame(rows_build)
 
 
@@ -4092,7 +4995,7 @@ def _bulk_metrics_additional_detail_df(b, a):
     return pd.DataFrame(rows_build)
 
 
-def _bulk_render_category_drill_down(row: pd.Series, merged_data) -> None:
+def _bulk_render_category_drill_down(row: pd.Series, merged_data, merged_data_py=None) -> None:
     """Внутри expander: Metrics / Additional / Decision (без логики decision_engine)."""
     try:
         cid = int(row["category_id"])
@@ -4100,9 +5003,13 @@ def _bulk_render_category_drill_down(row: pd.Series, merged_data) -> None:
     except (TypeError, ValueError):
         st.warning("Некорректный category_id.")
         return
-    data = _bulk_lookup_merged_category(merged_data, cid) if merged_data else None
+
     nm = str(row.get("category_name") or "").strip()
     title_name = nm if nm else "—"
+    parent_cat = str(row.get("parent_category_name") or "").strip()
+
+    data    = _bulk_lookup_merged_category(merged_data,    cid) if merged_data    else None
+    data_py = _bulk_lookup_merged_category(merged_data_py, cid) if merged_data_py else None
 
     _sig_ct = inspect.signature(st.container).parameters
     if "border" in _sig_ct:
@@ -4112,16 +5019,23 @@ def _bulk_render_category_drill_down(row: pd.Series, merged_data) -> None:
 
     with _outer:
         st.markdown(f"### Category {cid_disp}")
-        st.caption(title_name)
+        if parent_cat:
+            st.caption(f"{title_name} — decision by parent category: **{parent_cat}**")
+        else:
+            st.caption(title_name)
         st.markdown("---")
 
         st.markdown("**Metrics details**")
         if data is None:
             st.caption("Нет данных Current Year для этой категории.")
         else:
-            _b, _a = data.get("before") or {}, data.get("after") or {}
+            _b,  _a  = data.get("before") or {},    data.get("after") or {}
+            _pb, _pa = (data_py.get("before") or {} if data_py else {},
+                        data_py.get("after")  or {} if data_py else {})
             st.dataframe(
-                _bulk_metrics_primary_detail_df(_b, _a),
+                _style_detail_metrics_table(
+                    _bulk_metrics_primary_detail_df(_b, _a, _pb, _pa)
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -4132,7 +5046,9 @@ def _bulk_render_category_drill_down(row: pd.Series, merged_data) -> None:
         else:
             _b, _a = data.get("before") or {}, data.get("after") or {}
             st.dataframe(
-                _bulk_metrics_additional_detail_df(_b, _a),
+                _style_detail_metrics_table(
+                    _bulk_metrics_additional_detail_df(_b, _a)
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -5173,7 +6089,11 @@ st.divider()
 st.markdown('<p class="sd-h2 sd-h2-tight">Ручной ввод данных</p>', unsafe_allow_html=True)
 
 _cy_ba: dict[str, tuple[float, float]] = {}
-with st.expander("Ручной ввод данных · Current Year + Previous Year (матрица)", expanded=False):
+# Single-режим: матрица ручного ввода открыта по умолчанию (иначе ниже видны только даты Release/CY/PY).
+with st.expander(
+    "Ручной ввод данных · Current Year + Previous Year (матрица)",
+    expanded=bool(_category_single_mode),
+):
     _manuel_cy, _manuel_py = st.columns([1.08, 0.94], gap="small")
     with _manuel_cy:
         with st.container(border=True):
@@ -5194,6 +6114,9 @@ with st.expander("Ручной ввод данных · Current Year + Previous 
 
             for _dk, _dlabel, _dtyp in _CY_INPUT_METRICS:
                 sk = _cy_sess_key(_dk)
+                _float_min = (
+                    None if _dk in _CY_FLOAT_INPUT_ALLOW_NEGATIVE else 0.0
+                )
                 _cr0, _cr1, _cr2 = st.columns([1.55, 1, 1])
                 with _cr0:
                     st.markdown(_dlabel)
@@ -5208,7 +6131,7 @@ with st.expander("Ручной ввод данных · Current Year + Previous 
                     else:
                         _bv = st.number_input(
                             f"{_dlabel} — Before",
-                            min_value=0.0,
+                            min_value=_float_min,
                             key=f"{sk}_before",
                             label_visibility="collapsed",
                         )
@@ -5223,7 +6146,7 @@ with st.expander("Ручной ввод данных · Current Year + Previous 
                     else:
                         _av = st.number_input(
                             f"{_dlabel} — After",
-                            min_value=0.0,
+                            min_value=_float_min,
                             key=f"{sk}_after",
                             label_visibility="collapsed",
                         )
@@ -5281,8 +6204,9 @@ else:
 _cy_baseline_snap = {}
 if merged_data and _category_single_mode and _resolved_single_category_id is not None:
     _cid_tbl = int(_resolved_single_category_id)
-    if _cid_tbl in merged_data:
-        _bs = merged_data[_cid_tbl].get("baseline")
+    _cy_tbl_b = _bulk_lookup_merged_category(merged_data, _cid_tbl)
+    if _cy_tbl_b is not None:
+        _bs = _cy_tbl_b.get("baseline")
         if isinstance(_bs, dict):
             _cy_baseline_snap = _bs
 
@@ -5438,6 +6362,344 @@ _pot_df = _build_potential_spendings_table_df(
 _matrix_h_kw = _dataframe_tall_height_kw(len(_matrix_df))
 
 
+_PPD_SCENARIOS: dict[str, dict] = {
+    "PRICE_OK": {
+        "label": "Распределение стабильно",
+        "description": "Значимого перетока между шагами нет — цена приемлема для юзеров.",
+        "action": "Дополнительных действий не требуется.",
+        "sentiment": "positive",
+    },
+    "PRICE_TOO_HIGH": {
+        "label": "Цена чувствительна для юзеров",
+        "description": "Кампании перетекают с шагов выше дефолта на дешёвые (1st и default) — повышение цен слишком сильное.",
+        "action": "Риск снижения спендингов. Рассмотрите возврат к прежним ценам или меньшее повышение.",
+        "sentiment": "negative",
+    },
+    "CAN_RAISE_MORE": {
+        "label": "Можно поднять цену выше",
+        "description": "Кампании растут на шагах выше дефолта (особенно VIP) — юзеры готовы платить больше.",
+        "action": "Рассмотрите дополнительное повышение цен.",
+        "sentiment": "positive",
+    },
+    "HIGH_VIP_SHARE": {
+        "label": "Высокая концентрация на VIP",
+        "description": (
+            "Значительная доля кампаний на VIP-шаге — возможен супер-сезон, "
+            "сильная конкуренция за контакты или преимущественно бизнес-категория."
+        ),
+        "action": "Поднять цену только на VIP-шаг.",
+        "sentiment": "positive",
+    },
+    "VIP_TOO_EXPENSIVE": {
+        "label": "VIP-шаг слишком дорогой",
+        "description": "Юзеры уходят с VIP на шаги выше дефолта, но дешевле VIP — VIP-цена перестала оправдывать ценность.",
+        "action": "Снизить цену только на VIP-шаг.",
+        "sentiment": "negative",
+    },
+    "AFFECTS_INDIVIDUALS": {
+        "label": "Дорого для физических лиц",
+        "description": (
+            "VIP и дорогие шаги (выше дефолта) стабильны, но доля 1st и default шагов "
+            "значительно снизилась — физлица чувствуют ценовое давление."
+        ),
+        "action": "Снизить цены на 1st и default шаги.",
+        "sentiment": "negative",
+    },
+    "MIXED": {
+        "label": "Неоднозначная картина",
+        "description": "Изменения не укладываются в один сценарий — необходим дополнительный анализ.",
+        "action": "Проверьте распределение по каждому шагу вручную.",
+        "sentiment": "neutral",
+    },
+}
+
+
+def _classify_price_distribution(
+    before_dist: dict,
+    after_dist: dict,
+    grid: dict,
+) -> str | None:
+    if not before_dist or not after_dist or not grid:
+        return None
+
+    THRESHOLD = 0.05
+
+    first_steps       = {s for s, v in grid.items() if v.get("is_first")}
+    default_steps     = {s for s, v in grid.items() if v.get("is_default")}
+    vip_steps         = {s for s, v in grid.items() if v.get("is_vip")}
+    cheap_steps       = first_steps | default_steps
+    above_default     = {s for s in grid if s not in cheap_steps}
+    mid_above         = above_default - vip_steps
+
+    def _share(dist: dict, steps: set) -> float:
+        total = sum(dist.values()) or 1
+        return sum(dist.get(s, 0) for s in steps) / total
+
+    def _delta(steps: set) -> float | None:
+        sb = _share(before_dist, steps)
+        sa = _share(after_dist, steps)
+        return (sa - sb) / sb if sb > 0 else None
+
+    d_cheap = _delta(cheap_steps)
+    d_above = _delta(above_default)
+    d_vip   = _delta(vip_steps) if vip_steps else None
+    d_mid   = _delta(mid_above) if mid_above else None
+
+    vip_share_after = _share(after_dist, vip_steps) if vip_steps else 0.0
+
+    # Priority order: most specific / critical first
+    if d_cheap is not None and d_cheap > THRESHOLD and d_above is not None and d_above < -THRESHOLD:
+        return "PRICE_TOO_HIGH"
+
+    if (vip_steps and d_vip is not None and d_vip < -THRESHOLD
+            and d_mid is not None and d_mid > THRESHOLD
+            and (d_cheap is None or abs(d_cheap) <= THRESHOLD)):
+        return "VIP_TOO_EXPENSIVE"
+
+    if (d_above is not None and d_above >= -THRESHOLD
+            and d_cheap is not None and d_cheap < -THRESHOLD):
+        return "AFFECTS_INDIVIDUALS"
+
+    if vip_steps and vip_share_after > 0.25 and (d_vip is None or d_vip >= -THRESHOLD):
+        return "HIGH_VIP_SHARE"
+
+    if d_above is not None and d_above > THRESHOLD and (d_cheap is None or d_cheap <= THRESHOLD):
+        return "CAN_RAISE_MORE"
+
+    all_deltas = [d for d in [d_cheap, d_above, d_vip] if d is not None]
+    if all(abs(d) <= THRESHOLD for d in all_deltas):
+        return "PRICE_OK"
+
+    return "MIXED"
+
+
+def _render_price_per_day_block(
+    budget_dist: dict,
+    category_id: int,
+    scenario_code: str | None = None,
+) -> None:
+    try:
+        import altair as alt
+    except ImportError:
+        return
+
+    cat_dist = budget_dist.get(category_id)
+    if not cat_dist:
+        return
+
+    before_dist = cat_dist.get("before", {})
+    after_dist  = cat_dist.get("after", {})
+    grid        = cat_dist.get("grid", {})
+    if not before_dist and not after_dist:
+        return
+
+    total_b   = sum(before_dist.values()) or 1
+    total_a   = sum(after_dist.values()) or 1
+    all_steps = sorted(set(list(before_dist.keys()) + list(after_dist.keys()) + list(grid.keys())))
+    if not all_steps:
+        return
+
+    def _zone(step: int) -> str:
+        if grid:
+            info = grid.get(step, {})
+            if info.get("is_vip"):
+                return "VIP-step"
+            if info.get("is_default"):
+                return "default"
+            if info.get("is_first"):
+                return "1st step"
+            # find default step for relative position
+            default_steps = [s for s, v in grid.items() if v.get("is_default")]
+            if default_steps:
+                ds = default_steps[0]
+                return "decrease" if step < ds else "increase"
+        return ""
+
+    # Only include price steps that have at least one campaign in either period
+    active_steps = sorted(
+        s for s in all_steps
+        if before_dist.get(s, 0) > 0 or after_dist.get(s, 0) > 0
+    )
+    if not active_steps:
+        return
+
+    rows = []
+    for step in active_steps:
+        for period_lbl, dist, total in [
+            ("Default", before_dist, total_b),
+            ("Target",  after_dist,  total_a),
+        ]:
+            cnt = dist.get(step, 0)
+            pct = round(cnt / total * 100, 1) if cnt > 0 else 0.0
+            rows.append({
+                "step":      str(step),
+                "step_num":  step,
+                "period":    period_lbl,
+                "n":         cnt,
+                "pct":       pct,
+                "pct_label": f"{pct:.1f}%",
+            })
+
+    if not rows:
+        return
+
+    df_c = pd.DataFrame(rows)
+    df_c["x_key"] = df_c.apply(lambda r: f"{r['step']} {r['period']}", axis=1)
+
+    # Only show bars where there is actual data (n > 0)
+    df_c_active = df_c[df_c["n"] > 0].copy()
+    df_c_active["bar_h"] = 1.0
+
+    # Flat x-axis: only positions with data, preserving Default→Target order per step
+    x_order = []
+    for s in active_steps:
+        for period_lbl in ("Default", "Target"):
+            key = f"{s} {period_lbl}"
+            if key in df_c_active["x_key"].values:
+                x_order.append(key)
+
+    CHART_H   = 200   # px — bar area height
+    CENTER_PX = CHART_H // 2   # vertical center of bars in pixels from top
+
+    color_scale = alt.Scale(
+        domain=["Default", "Target"],
+        range=["#4A86C8", "#F5A623"],
+    )
+
+    bars = (
+        alt.Chart(df_c_active)
+        .mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5)
+        .encode(
+            x=alt.X(
+                "x_key:O",
+                sort=x_order,
+                axis=alt.Axis(
+                    labelAngle=0,
+                    labelFontSize=12,
+                    title="Price per day",
+                    titleFontSize=12,
+                    labelExpr="split(datum.label, ' ')[0]",
+                ),
+            ),
+            y=alt.Y(
+                "bar_h:Q",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=None,
+            ),
+            color=alt.Color(
+                "period:N",
+                scale=color_scale,
+                legend=None,
+            ),
+            tooltip=[
+                alt.Tooltip("step:O",      title="Price/day"),
+                alt.Tooltip("period:N",    title="Period"),
+                alt.Tooltip("n:Q",         title="Campaigns"),
+                alt.Tooltip("pct:Q",       title="% of total", format=".1f"),
+            ],
+        )
+    )
+
+    # Pct label centred inside bar — "XX.X%"
+    pct_text = (
+        alt.Chart(df_c_active)
+        .mark_text(
+            align="center", baseline="middle",
+            fontSize=16, fontWeight="bold",
+            dy=-10,
+        )
+        .encode(
+            x=alt.X("x_key:O", sort=x_order),
+            y=alt.value(CENTER_PX),
+            text=alt.Text("pct_label:N"),
+            color=alt.value("white"),
+        )
+    )
+
+    # Count label below pct — "N"
+    cnt_text = (
+        alt.Chart(df_c_active)
+        .mark_text(
+            align="center", baseline="middle",
+            fontSize=14, fontWeight="normal",
+            dy=10,
+        )
+        .encode(
+            x=alt.X("x_key:O", sort=x_order),
+            y=alt.value(CENTER_PX),
+            text=alt.Text("n:Q"),
+            color=alt.value("white"),
+        )
+    )
+
+    main_chart = (bars + pct_text + cnt_text).properties(height=CHART_H)
+
+    # Zone annotation strip — iterate only over positions that exist in x_order
+    zone_rows = []
+    seen_zones: set = set()
+    for x_key in x_order:
+        parts = x_key.rsplit(" ", 1)
+        s = int(parts[0])
+        z = _zone(s)
+        lbl = ""
+        if z and z not in seen_zones:
+            lbl = z
+            seen_zones.add(z)
+        zone_rows.append({"x_key": x_key, "zone_lbl": lbl})
+
+    zone_colors = {
+        "1st step": "#9B59B6", "default": "#E67E22",
+        "VIP-step": "#2C3E50", "decrease": "#85929E", "increase": "#85929E",
+    }
+
+    if zone_rows and any(r["zone_lbl"] for r in zone_rows):
+        df_zone = pd.DataFrame(zone_rows)
+        df_zone["color"] = df_zone["zone_lbl"].map(
+            lambda z: zone_colors.get(z, "#bbb")
+        )
+        zone_strip = (
+            alt.Chart(df_zone)
+            .mark_text(fontSize=9, fontWeight="bold", align="left", dx=4)
+            .encode(
+                x=alt.X(
+                    "x_key:O", sort=x_order,
+                    axis=alt.Axis(labels=False, ticks=False, title=None, domain=False),
+                ),
+                y=alt.value(10),
+                text=alt.Text("zone_lbl:N"),
+                color=alt.Color("color:N", scale=None, legend=None),
+            )
+            .properties(height=24)
+        )
+        chart = alt.vconcat(main_chart, zone_strip, spacing=0).configure_view(stroke=None)
+    else:
+        chart = main_chart
+
+    st.markdown("##### Price per day")
+    st.markdown(
+        "<span style='color:#4A86C8;font-size:18px'>■</span>&nbsp;<b>Default</b>&nbsp;&nbsp;&nbsp;"
+        "<span style='color:#F5A623;font-size:18px'>■</span>&nbsp;<b>Target</b>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Default (Before): **{total_b}** campaigns · "
+        f"Target (After): **{total_a}** campaigns"
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    if scenario_code and scenario_code in _PPD_SCENARIOS:
+        sc = _PPD_SCENARIOS[scenario_code]
+        _badge_icons = {
+            "positive": "🟢",
+            "negative": "🔴",
+            "neutral":  "🟡",
+        }
+        icon = _badge_icons.get(sc["sentiment"], "🔵")
+        st.markdown(
+            f"{icon} **{sc['label']}** — {sc['description']}",
+        )
+
+
 def _render_analytics_potential_block(*, show_heading: bool = True) -> None:
     if show_heading:
         st.markdown("##### Potential Spendings")
@@ -5472,6 +6734,16 @@ with st.container(border=bool(_category_single_mode)):
         st.dataframe(_sty_cy, use_container_width=True, hide_index=True, **_ms_df_kw)
     except TypeError:
         st.dataframe(_sty_cy, use_container_width=True, hide_index=True)
+
+_ppd_scenario: str | None = None
+if _category_single_mode and budget_dist:
+    _cat_dist_ppd = budget_dist.get(int(_resolved_single_category_id), {})
+    _ppd_scenario = _classify_price_distribution(
+        _cat_dist_ppd.get("before", {}),
+        _cat_dist_ppd.get("after", {}),
+        _cat_dist_ppd.get("grid", {}),
+    )
+    _render_price_per_day_block(budget_dist, int(_resolved_single_category_id), _ppd_scenario)
 
 if _category_single_mode:
     st.markdown(_ppv_matrix_primary_hint_html(_matrix_result_focus), unsafe_allow_html=True)
@@ -5612,6 +6884,14 @@ if _run_calc:
                 "Enter Previous Year Paid users, Spending, and Active listers (Before and After) "
                 "so diff Y2Y can be computed for NPL, Spending, and Conversion."
             )
+
+        if (
+            _ppd_scenario
+            and _ppd_scenario in _PPD_SCENARIOS
+            and _ppd_scenario not in ("PRICE_OK", "MIXED")
+        ):
+            _ppd_sc = _PPD_SCENARIOS[_ppd_scenario]
+            disp_ns = f"{disp_ns}\n\n**Price per day:** {_ppd_sc['action']}"
 
         with st.container(border=True):
             st.markdown("##### Results")
@@ -5780,7 +7060,7 @@ if _category_bulk_mode:
                 "(минимум), чтобы строить bulk-таблицу."
             )
         else:
-            st.session_state["bulk_analysis_result"] = _bulk_analysis_dataframe(
+            _bulk_result = _bulk_analysis_dataframe(
                 _bulk_effective_category_ids,
                 merged_data,
                 merged_data_previous_year or {},
@@ -5790,6 +7070,40 @@ if _category_bulk_mode:
                 list(_ov_n),
                 list(_ov_p),
             )
+
+            # ── Parent category fallback (aggregate children, no extra CH query) ──
+            try:
+                from clickhouse_loader import fetch_category_parents
+                _all_bulk_ids = [
+                    int(v) for v in _bulk_result["category_id"].tolist()
+                    if pd.notna(v)
+                ]
+                _insuf_mask = _bulk_result["final_decision"].apply(
+                    lambda x: str(x).strip() == "Insufficient data"
+                )
+                _insuf_count = int(_insuf_mask.sum())
+                if _insuf_count > 0:
+                    with st.spinner(f"Загружаем иерархию категорий…"):
+                        _child_to_parent, _cat_names = fetch_category_parents(_all_bulk_ids)
+                    if _child_to_parent:
+                        _parent_groups = _bulk_detect_parent_groups(
+                            _bulk_result, _child_to_parent, _cat_names
+                        )
+                        if _parent_groups:
+                            _bulk_result = _bulk_enrich_with_parents(
+                                _bulk_result, _parent_groups,
+                                merged_data, merged_data_previous_year or {},
+                                geo, scenario,
+                            )
+                            _enriched_n = int((_bulk_result["parent_category_name"] != "").sum())
+                            st.caption(
+                                f"Родительский анализ: {len(_parent_groups)} групп, "
+                                f"{_enriched_n} категорий получили решение по родителю."
+                            )
+            except Exception as _pe:
+                st.warning(f"Parent enrichment skipped: {_pe}")
+
+            st.session_state["bulk_analysis_result"] = _bulk_result
             st.session_state["bulk_run_nonce"] = int(st.session_state.get("bulk_run_nonce", 0)) + 1
 
     _bulk_df = st.session_state.get("bulk_analysis_result")
@@ -5931,13 +7245,29 @@ if _category_bulk_mode:
             if _sel_rows:
                 _row_sel = _base.iloc[int(_sel_rows[0])]
                 with st.expander("Category details", expanded=True):
-                    _bulk_render_category_drill_down(_row_sel, merged_data)
+                    _bulk_render_category_drill_down(
+                        _row_sel, merged_data,
+                        merged_data_py=st.session_state.get("merged_data_previous_year"),
+                    )
 
-        _csv_bytes = _bulk_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            label="Download CSV",
-            data=_csv_bytes,
-            file_name="bulk_analysis.csv",
-            mime="text/csv",
-            key="download_bulk_analysis_csv",
-        )
+        _dl_col1, _dl_col2 = st.columns([1, 1])
+        with _dl_col1:
+            _csv_export_df = _bulk_make_csv_export_df(_bulk_df)
+            _csv_bytes = _csv_export_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="Download CSV (wide)",
+                data=_csv_bytes,
+                file_name="bulk_analysis_wide.csv",
+                mime="text/csv",
+                key="download_bulk_analysis_csv",
+            )
+        with _dl_col2:
+            _long_csv_df = _bulk_make_long_csv_export_df(_bulk_df)
+            _long_csv_bytes = _long_csv_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                label="Download CSV (long)",
+                data=_long_csv_bytes,
+                file_name="bulk_analysis_long.csv",
+                mime="text/csv",
+                key="download_bulk_analysis_long_csv",
+            )

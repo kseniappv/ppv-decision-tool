@@ -6,6 +6,8 @@
 
 В **`app.py`** флаги **`_bulk_from_text`** (в поле Category ID разобрано **&gt; 1** валидный ID) или **`_bulk_from_pick`** (множественный выбор категорий). Тогда **`_category_bulk_mode`** и отображается подзаголовок **Bulk Category IDs** и блок **Bulk analysis**.
 
+**Merge по файлам (важно):** чтобы в **`merged_data`** и **`merged_data_previous_year`** появились категории из выгрузок, для **Current Year** нужны **оба** файла — **New PPV (spending)** и **Active listers** (пересечение по **`category_id`**). Один файл без второго ⇒ merge не запускается, в блоке статусов bulk все ID будут «вне данных». То же для **Previous Year**: оба слота (**Previous Year New PPV** и **Previous Year Active listers**).
+
 ## Парсинг category ID
 
 **`_parse_category_ids`**: разделители **пробел, запятая, `;`, перенос строки**; только целые числа; дубликаты схлопываются в порядке появления для текста; «пик» из UI — отдельный sorted список.

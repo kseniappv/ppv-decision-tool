@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# локальные тестовые выгрузки / PDF (не коммитить)
+samples/
