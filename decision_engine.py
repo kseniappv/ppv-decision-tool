@@ -19,16 +19,19 @@ GEO_THRESHOLDS = {
         "npl": {"growth": 5, "decline": -10},
         "sp": {"growth": 5, "decline": -10},
         "cr": {"growth": 5, "decline": -10},
+        "min_npl": 10,
     },
     "KG": {
         "npl": {"growth": 5, "decline": -10},
         "sp": {"growth": 5, "decline": -10},
         "cr": {"growth": 11, "decline": -10},
+        "min_npl": 10,
     },
     "AZ": {
         "npl": {"growth": 3, "decline": -8},
         "sp": {"growth": 3, "decline": -8},
         "cr": {"growth": 3.5, "decline": -10},
+        "min_npl": 5,
     },
     # RS thresholds are ambiguous in source files (e.g. CR 2.5 vs 3.9; NPL/SP as 9999).
     # Keep fallback to default until business rule is clarified.
@@ -262,7 +265,8 @@ def analyze_category(
         final_decision = decision_result["decision"]
         next_step = decision_result["next_step"]
 
-        if force_low_npl or npl_after < 10:
+        min_npl = thresholds.get("min_npl", 10)
+        if force_low_npl or npl_after < min_npl:
             final_decision = "Insufficient data"
             next_step = (
                 "The number of New Paid Listers is too small to draw a conclusion. "

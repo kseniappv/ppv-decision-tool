@@ -3127,6 +3127,7 @@ def _bulk_analysis_dataframe(
                 override_other_eff=other_eff,
                 override_new_eff=new_eff,
                 override_py_eff=py_eff,
+                geo=geo,
             )
             rows.append(
                 {
@@ -3184,6 +3185,7 @@ def _bulk_analysis_dataframe(
             override_other_eff=other_eff,
             override_new_eff=new_eff,
             override_py_eff=py_eff,
+            geo=geo,
         )
         row_is_new = scenario_used == "New category"
         row_is_py_anom = scenario_used == "Previous Year anomaly"
@@ -3269,7 +3271,7 @@ def _bulk_analysis_dataframe(
             "current_year" if (row_is_new or row_is_py_anom) else "diff_y2y"
         )
         _is_other_run = row_is_other
-        _low_npl_override_run = scenario_used == "Low NPL (<10)" or npl_a < 10
+        _low_npl_override_run = scenario_used == "Low NPL (<10)" or npl_a < _geo_min_npl(geo)
         y2y_decision_unavail = False
         if _matrix_focus_run == "current_year" or _is_other_run:
             disp_dc = result["decision_code"]
@@ -3321,7 +3323,7 @@ def _bulk_analysis_dataframe(
         _low_npl_insufficient_flag = (
             scenario_used != "Other category"
             and result["final_decision"] == "Insufficient data"
-            and (row_force_low or npl_a < 10)
+            and (row_force_low or npl_a < _geo_min_npl(geo))
         )
 
         _nm = _bulk_resolve_category_name(data)
@@ -4162,10 +4164,11 @@ def _bulk_resolve_scenario_used(
     override_other_eff: set[int],
     override_new_eff: set[int],
     override_py_eff: set[int],
+    geo: str | None = None,
 ) -> str:
     """
     Per-row scenario for bulk decisions: override lists (priority Other > New > PY anomaly),
-    then auto Low NPL when paid_users_after &lt; 10, else global Scenario from sidebar.
+    then auto Low NPL when paid_users_after < geo min_npl threshold, else global Scenario from sidebar.
     """
     if int(cid) in override_other_eff:
         return "Other category"
@@ -4173,7 +4176,7 @@ def _bulk_resolve_scenario_used(
         return "New category"
     if int(cid) in override_py_eff:
         return "Previous Year anomaly"
-    if paid_users_after is not None and int(paid_users_after) < 10:
+    if paid_users_after is not None and int(paid_users_after) < _geo_min_npl(geo):
         return "Low NPL auto"
     return global_scenario
 
@@ -4307,6 +4310,10 @@ if _category_bulk_mode:
 def _matrix_geo_thresholds(geo: str):
     gk = str(geo).upper() if geo else "default"
     return GEO_THRESHOLDS.get(gk, GEO_THRESHOLDS["default"])
+
+
+def _geo_min_npl(geo: str | None) -> int:
+    return _matrix_geo_thresholds(geo or "default").get("min_npl", 10)
 
 
 def _matrix_safe_div(numerator, denominator):
@@ -6839,7 +6846,7 @@ if _run_calc:
             "current_year" if (_nc_sc_run or _py_anom_sc_run) else "diff_y2y"
         )
         _is_other_run = _scenario_is_other_category(scenario)
-        _low_npl_override = scenario == "Low NPL (<10)" or paid_users_after < 10
+        _low_npl_override = scenario == "Low NPL (<10)" or paid_users_after < _geo_min_npl(geo)
 
         # Results block must use the same primary comparison period as PPV matrix to avoid conflicting interpretations.
         y2y_bundle = None
