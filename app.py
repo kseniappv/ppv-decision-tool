@@ -33,7 +33,7 @@ from ppv_data_loader import (
     load_and_merge_spending_active,
     pct_change_relative,
 )
-from clickhouse_loader import load_from_clickhouse, load_py_from_clickhouse, COUNTRY_ID_MAP as _CH_COUNTRY_MAP
+from clickhouse_loader import load_from_clickhouse, load_py_from_clickhouse, fetch_category_children, COUNTRY_ID_MAP as _CH_COUNTRY_MAP
 
 _LAYOUT_COMPACT_CSS = """
 <style>
@@ -2607,14 +2607,120 @@ with st.container():
             with st.spinner("Загружаем данные из ClickHouse…"):
                 try:
                     from dateutil.relativedelta import relativedelta
+
+                    # --- Intermediate category detection (single ID only) ---
+                    _load_ids = list(_ch_ids)
+                    _intermediate_parent_id = None
+                    _intermediate_child_names: dict[int, str] = {}
+                    if len(_ch_ids) == 1:
+                        _catalog_country_id = _CH_COUNTRY_MAP.get(geo) if geo else None
+                        _child_ids_check, _child_names_check = fetch_category_children(
+                            _ch_ids[0], country_id=_catalog_country_id
+                        )
+                        if _child_ids_check:
+                            _intermediate_parent_id = _ch_ids[0]
+                            _intermediate_child_names = _child_names_check
+                            _load_ids = _child_ids_check
+
                     _ch_merged, _ch_price, _ch_budget_dist = load_from_clickhouse(
-                        category_ids=_ch_ids,
+                        category_ids=_load_ids,
                         geo=geo,
                         before_from=_ch_before_from,
                         before_to=_ch_before_to,
                         after_from=_ch_after_from,
                         after_to=_ch_after_to,
                     )
+
+                    # --- Aggregate children into parent if intermediate ---
+                    if _intermediate_parent_id:
+                        _geo_key_ch = str(geo).upper() if geo else "default"
+                        _min_npl_ch = GEO_THRESHOLDS.get(_geo_key_ch, GEO_THRESHOLDS["default"]).get("min_npl", 10)
+                        _children_summary_ch = []
+                        _agg_b: dict = {"spending": 0.0, "paid_users": 0, "active_listers": 0,
+                                        "new_campaign_cnt": 0, "refund": 0.0,
+                                        "campaigns_with_refund": 0, "sum_plan_imp": 0.0, "sum_fact_imp": 0.0}
+                        _agg_a: dict = {k: type(v)() for k, v in _agg_b.items()}
+
+                        for _cid_ch in _load_ids:
+                            _cdata = _ch_merged.get(_cid_ch, {})
+                            _cb = _cdata.get("before", {}) or {}
+                            _ca = _cdata.get("after", {}) or {}
+                            _npl_a_ch = int(float(_ca.get("paid_users") or 0))
+                            _cname_ch = _intermediate_child_names.get(_cid_ch, str(_cid_ch))
+                            if not _cdata:
+                                _status_ch = "No data"
+                            elif _npl_a_ch >= _min_npl_ch:
+                                _status_ch = "Sufficient data"
+                            else:
+                                _status_ch = "Insufficient data"
+                            _children_summary_ch.append({
+                                "id": _cid_ch, "name": _cname_ch,
+                                "status": _status_ch, "npl_a": _npl_a_ch,
+                            })
+                            for _k in ("paid_users", "active_listers", "new_campaign_cnt", "campaigns_with_refund"):
+                                _agg_b[_k] += int(float(_cb.get(_k) or 0))
+                                _agg_a[_k] += int(float(_ca.get(_k) or 0))
+                            for _k in ("spending", "refund", "sum_plan_imp", "sum_fact_imp"):
+                                _agg_b[_k] += float(_cb.get(_k) or 0)
+                                _agg_a[_k] += float(_ca.get(_k) or 0)
+
+                        def _build_agg_bucket(agg: dict) -> dict:
+                            d: dict = {
+                                "spending": agg["spending"],
+                                "paid_users": agg["paid_users"],
+                                "active_listers": agg["active_listers"],
+                                "new_campaign_cnt": agg["new_campaign_cnt"],
+                                "refund": agg["refund"],
+                            }
+                            camp = agg["new_campaign_cnt"]; paid = agg["paid_users"]
+                            plan = agg["sum_plan_imp"];     fact = agg["sum_fact_imp"]
+                            cr = agg["campaigns_with_refund"]
+                            if camp > 0:
+                                d["campaign_per_user"] = round(camp / paid, 4) if paid > 0 else None
+                                d["arp_p_campaign"] = round(agg["spending"] / camp, 4)
+                                d["pct_campaign_with_refund"] = round(cr / camp * 100, 4)
+                                d["plan_imp_per_campaign"] = round(plan / camp, 4)
+                                d["fact_imp_per_campaign"] = round(fact / camp, 4)
+                                if plan > 0:
+                                    d["pct_execution_inventory"] = round(fact / plan * 100 - 100, 4)
+                            return d
+
+                        _ch_merged = {
+                            _intermediate_parent_id: {
+                                "baseline": {},
+                                "before": _build_agg_bucket(_agg_b),
+                                "after":  _build_agg_bucket(_agg_a),
+                            }
+                        }
+
+                        # Aggregate budget_dist
+                        _bd_b_agg: dict = {}; _bd_a_agg: dict = {}; _bd_grid_agg: dict = {}
+                        for _cid_ch in _load_ids:
+                            _bd = _ch_budget_dist.get(_cid_ch, {})
+                            for _s, _n in _bd.get("before", {}).items():
+                                _bd_b_agg[_s] = _bd_b_agg.get(_s, 0) + _n
+                            for _s, _n in _bd.get("after", {}).items():
+                                _bd_a_agg[_s] = _bd_a_agg.get(_s, 0) + _n
+                            if _bd.get("grid") and not _bd_grid_agg:
+                                _bd_grid_agg = _bd["grid"]
+                        _ch_budget_dist = {_intermediate_parent_id: {
+                            "before": _bd_b_agg, "after": _bd_a_agg, "grid": _bd_grid_agg,
+                        }}
+
+                        # Price data: use first child that has it
+                        _first_ch_price = next((_c for _c in _load_ids if _c in _ch_price), None)
+                        if _first_ch_price:
+                            _ch_price = {_intermediate_parent_id: _ch_price[_first_ch_price]}
+
+                        st.session_state["_intermediate_children_summary"] = {
+                            "parent_id": _intermediate_parent_id,
+                            "children": _children_summary_ch,
+                            "min_npl": _min_npl_ch,
+                        }
+                    else:
+                        st.session_state.pop("_intermediate_children_summary", None)
+                    # --- End intermediate aggregation ---
+
                     st.session_state["merged_data"] = _ch_merged
                     st.session_state["price_data"] = _ch_price
                     st.session_state["budget_dist"] = _ch_budget_dist
@@ -2628,13 +2734,31 @@ with st.container():
                     _py_after_from  = _ch_after_from  - relativedelta(years=1)
                     _py_after_to    = _ch_after_to    - relativedelta(years=1)
                     _ch_merged_py = load_py_from_clickhouse(
-                        category_ids=_ch_ids,
+                        category_ids=_load_ids,
                         geo=geo,
                         before_from=_py_before_from,
                         before_to=_py_before_to,
                         after_from=_py_after_from,
                         after_to=_py_after_to,
                     )
+                    # For intermediate: aggregate PY children the same way
+                    if _intermediate_parent_id and _ch_merged_py:
+                        _py_agg_b: dict = {"spending": 0.0, "paid_users": 0, "active_listers": 0}
+                        _py_agg_a: dict = {k: type(v)() for k, v in _py_agg_b.items()}
+                        for _cid_ch in _load_ids:
+                            _py_d = _ch_merged_py.get(_cid_ch, {})
+                            _py_b = _py_d.get("before", {}) or {}
+                            _py_a = _py_d.get("after", {}) or {}
+                            _py_agg_b["paid_users"]     += int(float(_py_b.get("paid_users") or 0))
+                            _py_agg_a["paid_users"]     += int(float(_py_a.get("paid_users") or 0))
+                            _py_agg_b["spending"]       += float(_py_b.get("spending") or 0)
+                            _py_agg_a["spending"]       += float(_py_a.get("spending") or 0)
+                            _py_agg_b["active_listers"] += int(float(_py_b.get("active_listers") or 0))
+                            _py_agg_a["active_listers"] += int(float(_py_a.get("active_listers") or 0))
+                        _ch_merged_py = {_intermediate_parent_id: {
+                            "before": _py_agg_b, "after": _py_agg_a,
+                        }}
+
                     st.session_state["merged_data_previous_year"] = _ch_merged_py
                     st.session_state["_py_merge_dirty"] = True
 
@@ -2663,11 +2787,34 @@ with st.container():
             st.session_state.pop("budget_dist", None)
             st.session_state.pop("_ch_data_loaded", None)
             st.session_state.pop("merged_data_previous_year", None)
+            st.session_state.pop("_intermediate_children_summary", None)
             st.rerun()
 
         if st.session_state.get("_ch_data_loaded"):
             _ch_loaded_n = len(st.session_state.get("merged_data") or {})
             st.info(f"Активен источник: **ClickHouse** — {_ch_loaded_n} категорий загружено.")
+
+            _ics = st.session_state.get("_intermediate_children_summary")
+            if _ics:
+                _ics_min = _ics["min_npl"]
+                _ics_children = _ics["children"]
+                _ics_suf  = [c for c in _ics_children if c["status"] == "Sufficient data"]
+                _ics_insuf = [c for c in _ics_children if c["status"] == "Insufficient data"]
+                _ics_nodata = [c for c in _ics_children if c["status"] == "No data"]
+                st.markdown(
+                    f"**Промежуточная категория** (ID {_ics['parent_id']}) — "
+                    f"агрегировано {len(_ics_children)} дочерних категорий "
+                    f"(порог: ≥{_ics_min} тратников):"
+                )
+                if _ics_suf:
+                    _suf_list = ", ".join(f"{c['name']} ({c['id']}, {c['npl_a']} тр.)" for c in _ics_suf)
+                    st.markdown(f"- ✅ **Sufficient data** ({len(_ics_suf)}): {_suf_list}")
+                if _ics_insuf:
+                    _insuf_list = ", ".join(f"{c['name']} ({c['id']}, {c['npl_a']} тр.)" for c in _ics_insuf)
+                    st.markdown(f"- ⚠️ **Insufficient data** ({len(_ics_insuf)}): {_insuf_list}")
+                if _ics_nodata:
+                    _nodata_list = ", ".join(f"{c['name']} ({c['id']})" for c in _ics_nodata)
+                    st.markdown(f"- ❌ **No data** ({len(_ics_nodata)}): {_nodata_list}")
 
     merged_data = {}
     price_data = {}

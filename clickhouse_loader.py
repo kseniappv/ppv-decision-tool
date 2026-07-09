@@ -506,3 +506,49 @@ def fetch_category_parents(
         client.close()
 
     return child_to_parent, cat_names
+
+
+def fetch_category_children(
+    parent_id: int,
+    country_id: int | None = None,
+) -> tuple[list[int], dict[int, str]]:
+    """
+    Return direct children of parent_id from the country-specific tree
+    (category_country), falling back to the master tree (category) if
+    country_id is None or no rows found.
+
+    Returns (child_ids, {child_id: name}).
+    """
+    client = _get_client()
+    try:
+        # Country-specific tree: category_country has per-country parent_id
+        if country_id is not None:
+            rows = client.query(f"""
+                SELECT cc.category_id, c.name
+                FROM pg_catalog_microservice.category_country cc
+                JOIN pg_catalog_microservice.category c ON c.id = cc.category_id
+                WHERE cc.parent_id = {parent_id}
+                  AND cc.country_id = {country_id}
+                  AND cc.active = true
+                  AND cc.enabled = true
+                  AND c.is_deleted = false
+            """).result_rows
+            if rows:
+                child_ids = [int(r[0]) for r in rows]
+                names = {int(r[0]): str(r[1]) for r in rows}
+                return child_ids, names
+
+        # Fallback: master tree
+        rows = client.query(f"""
+            SELECT id, name
+            FROM pg_catalog_microservice.category
+            WHERE parent_id = {parent_id}
+              AND is_deleted = false
+        """).result_rows
+        child_ids = [int(r[0]) for r in rows]
+        names = {int(r[0]): str(r[1]) for r in rows}
+        return child_ids, names
+    except Exception:
+        return [], {}
+    finally:
+        client.close()
