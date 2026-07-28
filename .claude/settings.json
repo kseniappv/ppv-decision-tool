@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('clickhouse_loader.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import pptx; print\\(pptx.__version__\\)\")",
+      "Bash(pip install *)",
+      "Bash(mkdir -p /tmp/ppv_screenshots)",
+      "Bash(osascript)",
+      "Bash(screencapture -x /tmp/ppv_screenshots/screen_main.png)",
+      "Bash(python -c \"import clickhouse_loader; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('app.py syntax OK'\\)\")",
+      "Bash(python3 -c ' *)"
+    ],
+    "additionalDirectories": [
+      "/Users/kseniamorozova/Documents/lalafo/ppv-monitoring-agent"
+    ]
+  }
+}
