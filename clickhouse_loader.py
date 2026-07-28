@@ -19,7 +19,9 @@ import pandas as pd
 _CH_HOST = os.getenv("CH_HOST", "ch-prod.yallasvc.net")
 _CH_PORT = int(os.getenv("CH_PORT", "8123"))
 _CH_USER = os.getenv("CH_USER", "app_data_uploader_20250626")
-_CH_PASSWORD = os.getenv("CH_PASSWORD", "XTGBs7JjcCT5XiT3L8d8HYc7KQdpAk0t")
+# Пароль только из окружения: локально — export CH_PASSWORD=...,
+# в kube — Vault-секрет prototype/ppv-decision-tool/<env>/secret.
+_CH_PASSWORD = os.getenv("CH_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
 # Country IDs
@@ -34,6 +36,12 @@ COUNTRY_ID_MAP: dict[str, Optional[int]] = {
 
 def _get_client():
     import clickhouse_connect
+    if not _CH_PASSWORD:
+        raise RuntimeError(
+            "CH_PASSWORD не задан — задайте переменную окружения "
+            "(локально: export CH_PASSWORD=...; в kube пароль приходит "
+            "из Vault-секрета prototype/ppv-decision-tool/<env>/secret)."
+        )
     return clickhouse_connect.get_client(
         host=_CH_HOST,
         port=_CH_PORT,
