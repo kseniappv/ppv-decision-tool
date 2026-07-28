@@ -1,0 +1,22 @@
+{{- if .Values.app.ingress.enabled }}
+{{- $host := .Values.app.ingress.host | default .Values.werf.ci_url }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Chart.Name }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 32m
+spec:
+  ingressClassName: "{{ .Values.app.ingress.class }}"
+  rules:
+  - host: {{ $host }}
+    http:
+      paths:
+      - path: "/"
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: {{ .Chart.Name }}
+            port:
+              number: 8501
+{{- end }}

@@ -1,0 +1,42 @@
+## Base / default values for ppv-decision-tool.
+## Per-env files (values-develop.yaml) merge on top via WERF_VALUES_* in CI.
+## Non-secret config goes to the ConfigMap; CH_USER / CH_PASSWORD come from Vault.
+
+infr:
+  replicas:
+    app:
+      _default: 1
+
+app:
+  # HashiCorp Vault provides CH_USER / CH_PASSWORD
+  # (vault kv: prototype/ppv-decision-tool/<env>/secret).
+  vault:
+    enabled: true
+    mount: secret
+    type: kv-v2
+
+  # Public hostname / Ingress. Off by default — enable per env.
+  ingress:
+    enabled: false
+    host: ""
+    class: nginx-internal
+
+  # ClickHouse connection (non-secret → ConfigMap). Creds come from Vault.
+  clickhouse:
+    host:
+      _default: "ch-prod.yallasvc.net"
+    port:
+      _default: 8123
+
+  resources:
+    app:
+      requests:
+        cpu:
+          _default: 100m
+        memory:
+          _default: 512Mi
+      limits:
+        cpu:
+          _default: "1"
+        memory:
+          _default: 1Gi

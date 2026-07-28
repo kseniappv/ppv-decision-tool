@@ -1,0 +1,51 @@
+default:
+  before_script:
+    - |
+      # Resolve the env-specific Helm values file and feed it to werf
+      # (same pattern as the neighbouring prototypes). Without this
+      # .helm/values-<env>.yaml files are never applied.
+      ENV_NAME="${WERF_ENV:-${CI_ENVIRONMENT_NAME%%/*}}"
+      ENV_VALUES_FILE=".helm/values-${ENV_NAME}.yaml"
+      if [ -n "$ENV_NAME" ] && [ -f "$ENV_VALUES_FILE" ]; then
+        export WERF_VALUES_1="$ENV_VALUES_FILE"
+        echo "[env-values] Using $ENV_VALUES_FILE"
+      fi
+      if [ -n "$ENV_NAME" ]; then
+        export WERF_ENV="$ENV_NAME"
+      fi
+
+include:
+  - project: 'public-infra/gitlab-ci'
+    ref: werf_2
+    file: base-gitlab-ci.yaml
+  - project: 'public-infra/gitlab-ci'
+    ref: werf_2
+    file: cleanup.yaml
+
+# Prototype: only develop is a real target; build/deploy are best-effort
+# (allow_failure) like the neighbouring prototypes.
+Build:
+  allow_failure: true
+
+Deploy to Develop:
+  allow_failure: true
+
+Deploy to Stage (auto):
+  allow_failure: true
+
+Deploy to Production:
+  allow_failure: true
+
+# Offline unit tests. Pure-python, no ClickHouse/Jira needed.
+pytest:
+  stage: code-test
+  image: python:3.11-slim
+  before_script:
+    - pip install --no-cache-dir -r requirements.txt
+  script:
+    - python -m compileall -q app.py decision_engine.py clickhouse_loader.py ppv_data_loader.py number_format.py scripts/jira_bulk_analysis.py
+    - pytest -q test_decision_engine.py
+  tags:
+    - werf
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"'

@@ -1,0 +1,8 @@
+giterminismConfigVersion: 1
+config:
+  goTemplateRendering:
+    allowEnvVariables:
+    - CI_PIPELINE_ID
+    - CI_COMMIT_REF_SLUG
+    - CI_COMMIT_SHA
+    - WERF_ENV

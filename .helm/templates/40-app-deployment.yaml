@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Chart.Name }}
+  annotations:
+    "werf.io/set-replicas-only-on-creation": "true"
+spec:
+  replicas: {{ pluck .Values.werf.env .Values.infr.replicas.app | first | default .Values.infr.replicas.app._default }}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      service: {{ .Chart.Name }}
+  template:
+    metadata:
+      annotations:
+        checksum/env-configmap: {{ include (print $.Template.BasePath "/32-env-configmap.yaml") . | sha256sum }}
+        # Changes every CI run so a redeploy always rolls the pod and re-reads
+        # ConfigMap + Vault secrets (envFrom is read once at container start).
+        ci-job-id: {{ .Values.werf.ci_job_id | default "0" | quote }}
+      labels:
+        service: {{ .Chart.Name }}
+    spec:
+      imagePullSecrets:
+      - name: registrysecret
+      containers:
+      - name: app
+        image: {{ .Values.werf.image.app }}
+        ports:
+        - containerPort: 8501
+          protocol: TCP
+          name: http
+        livenessProbe:
+          httpGet:
+            port: 8501
+            path: /_stcore/health
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            port: 8501
+            path: /_stcore/health
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 10
+        envFrom:
+        - configMapRef:
+            name: {{ .Chart.Name }}-env-config
+        {{- if and .Values.app.vault.enabled (ne .Values.werf.env "review") }}
+        - secretRef:
+            name: {{ .Chart.Name }}-vault-secrets
+        {{- end }}
+        env:
+        - name: APP_VERSION
+          value: {{ .Values.werf.ci_job_id | default "dev" | quote }}
+        resources:
+          requests:
+            cpu: {{ pluck .Values.werf.env .Values.app.resources.app.requests.cpu | first | default .Values.app.resources.app.requests.cpu._default }}
+            memory: {{ pluck .Values.werf.env .Values.app.resources.app.requests.memory | first | default .Values.app.resources.app.requests.memory._default }}
+          limits:
+            cpu: {{ pluck .Values.werf.env .Values.app.resources.app.limits.cpu | first | default .Values.app.resources.app.limits.cpu._default }}
+            memory: {{ pluck .Values.werf.env .Values.app.resources.app.limits.memory | first | default .Values.app.resources.app.limits.memory._default }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}
+  labels:
+    service: {{ .Chart.Name }}
+spec:
+  selector:
+    service: {{ .Chart.Name }}
+  ports:
+  - name: http
+    port: 8501
+    protocol: TCP
+    targetPort: http

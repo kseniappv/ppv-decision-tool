@@ -1,0 +1,6 @@
+configVersion: 1
+project: ppv-decision-tool
+---
+image: app
+dockerfile: Dockerfile
+context: .

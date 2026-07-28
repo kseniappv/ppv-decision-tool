@@ -1,0 +1,9 @@
+## Overrides for the develop environment (kube-two).
+
+app:
+  vault:
+    enabled: true
+  ingress:
+    enabled: true
+    host: ppv-decision-tool-develop.kube-two.yallasvc.net
+    class: nginx-internal
