@@ -26,6 +26,7 @@ SPENDING_MEASURE_ALIASES: Mapping[str, str] = {
     "npl": "paid_users",
     "spending": "spending",
     "spendings": "spending",
+    "spending v2": "spending",  # source renamed (Tableau PPV, 2026-08)
     "campaign per user": "campaign_per_user",
     "new campaign cnt": "new_campaign_cnt",
     "new campaign count": "new_campaign_cnt",
@@ -42,6 +43,11 @@ SPENDING_MEASURE_ALIASES: Mapping[str, str] = {
     "execution inventory": "pct_execution_inventory",
     "arppcampaing": "arp_p_campaign",
     "arppcampaign": "arp_p_campaign",
+    # source renamed to "ARPpCampaign v2" (Tableau PPV, 2026-08)
+    "arppcampaign v2": "arp_p_campaign",
+    "arppcampaing v2": "arp_p_campaign",
+    "arp pcampaign v2": "arp_p_campaign",
+    "arpp campaign v2": "arp_p_campaign",
 }
 
 _CSV_ENCODINGS = (

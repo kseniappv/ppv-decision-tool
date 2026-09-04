@@ -48,7 +48,7 @@ def _get_client():
         username=_CH_USER,
         password=_CH_PASSWORD,
         connect_timeout=8,
-        send_receive_timeout=60,
+        send_receive_timeout=300,
     )
 
 

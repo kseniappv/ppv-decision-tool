@@ -188,18 +188,20 @@ def _apply_desktop_layout() -> None:
 
 
 # Current-year metrics: (data_key, label, "int"|"float"). Order = одна строка на метрику в сводной таблице.
+# Порядок отражает новую структуру источника (Tableau PPV spending, с 2026-08):
+#   Refund / %Campaign with refund / Plan / Fact / %Execution — перед ARPpCampaign и Spending.
 _CY_INPUT_METRICS = (
     ("paid_users", "Paid users", "int"),
     ("campaign_per_user", "Campaign per User", "float"),
     ("new_campaign_cnt", "New campaign cnt", "int"),
     ("price_per_day", "Price per day", "float"),
-    ("arp_p_campaign", "ARPpCampaign", "float"),
-    ("spending", "Spending", "float"),
     ("refund", "Refund", "float"),
     ("pct_campaign_with_refund", "%Campaign with refund", "float"),
     ("plan_imp_per_campaign", "Plan Imp per Campaign", "float"),
     ("fact_imp_per_campaign", "Fact Imp per Campaign", "float"),
     ("pct_execution_inventory", "%Execution Inventory", "float"),
+    ("arp_p_campaign", "ARPpCampaign", "float"),
+    ("spending", "Spending", "float"),
     ("active_listers", "Active Listers", "int"),
 )
 
@@ -1289,10 +1291,17 @@ def _ocr_aliases_for_cy() -> dict[str, tuple[str, ...]]:
                     "arpp campaign",
                     "arppu campaign",
                     "arppucampaign",
+                    # source renamed to "ARPpCampaign v2" (Tableau, 2026-08)
+                    "arppcampaign v2",
+                    "arppcampaing v2",
+                    "arp pcampaign v2",
+                    "arpp campaign v2",
+                    "arppu campaign v2",
+                    "arppucampaign v2",
                 ]
             )
         elif dk == "spending":
-            extra.extend(["spending", "spend"])
+            extra.extend(["spending", "spend", "spending v2", "spend v2"])
         elif dk == "refund":
             extra.extend(["refund"])
         elif dk == "pct_campaign_with_refund":
@@ -1536,9 +1545,10 @@ def _py_fill_from_row_order_if_empty(
     if len(rows_left) >= 1 and _need("paid_users"):
         b0, a0 = rows_left[0]
         result["paid_users"] = {"before": b0, "after": a0}
-    if len(rows_left) >= 6 and _need("spending"):
-        b5, a5 = rows_left[5]
-        result["spending"] = {"before": b5, "after": a5}
+    # Spending moved to row 11 (index 10) in the new source order (Tableau PPV, 2026-08).
+    if len(rows_left) >= 11 and _need("spending"):
+        b10, a10 = rows_left[10]
+        result["spending"] = {"before": b10, "after": a10}
 
     if not _need("active_listers"):
         return
