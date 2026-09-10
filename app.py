@@ -6642,11 +6642,6 @@ def _render_price_per_day_block(
     category_id: int,
     scenario_code: str | None = None,
 ) -> None:
-    try:
-        import altair as alt
-    except ImportError:
-        return
-
     cat_dist = budget_dist.get(category_id)
     if not cat_dist:
         return
@@ -6657,199 +6652,125 @@ def _render_price_per_day_block(
     if not before_dist and not after_dist:
         return
 
-    total_b   = sum(before_dist.values()) or 1
-    total_a   = sum(after_dist.values()) or 1
-    all_steps = sorted(set(list(before_dist.keys()) + list(after_dist.keys()) + list(grid.keys())))
-    if not all_steps:
-        return
+    total_b = sum(before_dist.values()) or 1
+    total_a = sum(after_dist.values()) or 1
+
+    default_step = next((s for s, v in grid.items() if v.get("is_default")), None)
 
     def _zone(step: int) -> str:
-        if grid:
-            info = grid.get(step, {})
-            if info.get("is_vip"):
-                return "VIP-step"
-            if info.get("is_default"):
-                return "default"
-            if info.get("is_first"):
-                return "1st step"
-            # find default step for relative position
-            default_steps = [s for s, v in grid.items() if v.get("is_default")]
-            if default_steps:
-                ds = default_steps[0]
-                return "decrease" if step < ds else "increase"
-        return ""
+        if default_step is None:
+            return "increase"
+        if step < default_step:
+            return "decrease"
+        if step == default_step:
+            return "default"
+        return "increase"
 
-    # Only include price steps that have at least one campaign in either period
     active_steps = sorted(
-        s for s in all_steps
+        s for s in set(list(before_dist) + list(after_dist))
         if before_dist.get(s, 0) > 0 or after_dist.get(s, 0) > 0
     )
     if not active_steps:
         return
 
-    rows = []
+    # Per-cell data
+    table_data: dict = {}
     for step in active_steps:
-        for period_lbl, dist, total in [
-            ("Default", before_dist, total_b),
-            ("Target",  after_dist,  total_a),
-        ]:
-            cnt = dist.get(step, 0)
-            pct = round(cnt / total * 100, 1) if cnt > 0 else 0.0
-            rows.append({
-                "step":      str(step),
-                "step_num":  step,
-                "period":    period_lbl,
-                "n":         cnt,
-                "pct":       pct,
-                "pct_label": f"{pct:.1f}%",
-            })
+        b = before_dist.get(step, 0)
+        a = after_dist.get(step, 0)
+        table_data[step] = {
+            "Default": {"n": b, "pct": b / total_b * 100},
+            "Target":  {"n": a, "pct": a / total_a * 100},
+        }
 
-    if not rows:
-        return
+    all_pcts = [v["pct"] for d in table_data.values() for v in d.values() if v["n"] > 0]
+    max_pct = max(all_pcts) if all_pcts else 1.0
 
-    df_c = pd.DataFrame(rows)
-    df_c["x_key"] = df_c.apply(lambda r: f"{r['step']} {r['period']}", axis=1)
+    def _cell_color(pct: float) -> tuple[str, str]:
+        if pct == 0:
+            return "#f5f7fa", "#aaa"
+        ratio = min(pct / max_pct, 1.0)
+        # Light (#aed6f1) → dark (#154360), same palette as Tableau
+        r = int(0xae + (0x15 - 0xae) * ratio)
+        g = int(0xd6 + (0x43 - 0xd6) * ratio)
+        b = int(0xf1 + (0x60 - 0xf1) * ratio)
+        fg = "#fff" if ratio > 0.45 else "#2c3e50"
+        return f"#{r:02x}{g:02x}{b:02x}", fg
 
-    # Only show bars where there is actual data (n > 0)
-    df_c_active = df_c[df_c["n"] > 0].copy()
-    df_c_active["bar_h"] = 1.0
+    ZONE_ORDER = ["decrease", "default", "increase"]
+    ZONE_BG = {"decrease": "#85929e", "default": "#e67e22", "increase": "#85929e"}
+    grouped = {z: [s for s in active_steps if _zone(s) == z] for z in ZONE_ORDER}
+    active_zones = [(z, grouped[z]) for z in ZONE_ORDER if grouped[z]]
 
-    # Flat x-axis: only positions with data, preserving Default→Target order per step
-    x_order = []
-    for s in active_steps:
-        for period_lbl in ("Default", "Target"):
-            key = f"{s} {period_lbl}"
-            if key in df_c_active["x_key"].values:
-                x_order.append(key)
+    th = "padding:5px 4px;text-align:center;border:1px solid rgba(255,255,255,0.25);white-space:nowrap"
+    td = "padding:0;border:1px solid #d0d0d0;text-align:center;min-width:58px"
 
-    CHART_H   = 200   # px — bar area height
-    CENTER_PX = CHART_H // 2   # vertical center of bars in pixels from top
+    rows_html: list[str] = []
 
-    color_scale = alt.Scale(
-        domain=["Default", "Target"],
-        range=["#4A86C8", "#F5A623"],
-    )
-
-    bars = (
-        alt.Chart(df_c_active)
-        .mark_bar(cornerRadiusTopLeft=5, cornerRadiusTopRight=5)
-        .encode(
-            x=alt.X(
-                "x_key:O",
-                sort=x_order,
-                axis=alt.Axis(
-                    labelAngle=0,
-                    labelFontSize=12,
-                    title="Price per day",
-                    titleFontSize=12,
-                    labelExpr="split(datum.label, ' ')[0]",
-                ),
-            ),
-            y=alt.Y(
-                "bar_h:Q",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=None,
-            ),
-            color=alt.Color(
-                "period:N",
-                scale=color_scale,
-                legend=None,
-            ),
-            tooltip=[
-                alt.Tooltip("step:O",      title="Price/day"),
-                alt.Tooltip("period:N",    title="Period"),
-                alt.Tooltip("n:Q",         title="Campaigns"),
-                alt.Tooltip("pct:Q",       title="% of total", format=".1f"),
-            ],
+    # Row 1 — zone labels
+    rows_html.append("<tr>")
+    for z, steps in active_zones:
+        colspan = len(steps) * 2
+        rows_html.append(
+            f'<th colspan="{colspan}" style="{th};background:{ZONE_BG[z]};'
+            f'color:#fff;font-size:11px;font-weight:bold">{z}</th>'
         )
-    )
+    rows_html.append("</tr>")
 
-    # Pct label centred inside bar — "XX.X%"
-    pct_text = (
-        alt.Chart(df_c_active)
-        .mark_text(
-            align="center", baseline="middle",
-            fontSize=16, fontWeight="bold",
-            dy=-10,
-        )
-        .encode(
-            x=alt.X("x_key:O", sort=x_order),
-            y=alt.value(CENTER_PX),
-            text=alt.Text("pct_label:N"),
-            color=alt.value("white"),
-        )
-    )
-
-    # Count label below pct — "N"
-    cnt_text = (
-        alt.Chart(df_c_active)
-        .mark_text(
-            align="center", baseline="middle",
-            fontSize=14, fontWeight="normal",
-            dy=10,
-        )
-        .encode(
-            x=alt.X("x_key:O", sort=x_order),
-            y=alt.value(CENTER_PX),
-            text=alt.Text("n:Q"),
-            color=alt.value("white"),
-        )
-    )
-
-    main_chart = (bars + pct_text + cnt_text).properties(height=CHART_H)
-
-    # Zone annotation strip — iterate only over positions that exist in x_order
-    zone_rows = []
-    seen_zones: set = set()
-    for x_key in x_order:
-        parts = x_key.rsplit(" ", 1)
-        s = int(parts[0])
-        z = _zone(s)
-        lbl = ""
-        if z and z not in seen_zones:
-            lbl = z
-            seen_zones.add(z)
-        zone_rows.append({"x_key": x_key, "zone_lbl": lbl})
-
-    zone_colors = {
-        "1st step": "#9B59B6", "default": "#E67E22",
-        "VIP-step": "#2C3E50", "decrease": "#85929E", "increase": "#85929E",
-    }
-
-    if zone_rows and any(r["zone_lbl"] for r in zone_rows):
-        df_zone = pd.DataFrame(zone_rows)
-        df_zone["color"] = df_zone["zone_lbl"].map(
-            lambda z: zone_colors.get(z, "#bbb")
-        )
-        zone_strip = (
-            alt.Chart(df_zone)
-            .mark_text(fontSize=9, fontWeight="bold", align="left", dx=4)
-            .encode(
-                x=alt.X(
-                    "x_key:O", sort=x_order,
-                    axis=alt.Axis(labels=False, ticks=False, title=None, domain=False),
-                ),
-                y=alt.value(10),
-                text=alt.Text("zone_lbl:N"),
-                color=alt.Color("color:N", scale=None, legend=None),
+    # Row 2 — price values
+    rows_html.append("<tr>")
+    for _, steps in active_zones:
+        for step in steps:
+            rows_html.append(
+                f'<th colspan="2" style="{th};background:#eaf0f6;'
+                f'color:#2c3e50;font-size:12px;font-weight:600">{step}</th>'
             )
-            .properties(height=24)
-        )
-        chart = alt.vconcat(main_chart, zone_strip, spacing=0).configure_view(stroke=None)
-    else:
-        chart = main_chart
+    rows_html.append("</tr>")
+
+    # Row 3 — period labels
+    PERIOD_BG = {"Default": "#4a86c8", "Target": "#e8a020"}
+    rows_html.append("<tr>")
+    for _, steps in active_zones:
+        for _ in steps:
+            for period in ("Default", "Target"):
+                rows_html.append(
+                    f'<th style="{th};background:{PERIOD_BG[period]};'
+                    f'color:#fff;font-size:10px;font-weight:500">{period}</th>'
+                )
+    rows_html.append("</tr>")
+
+    # Row 4 — data cells
+    rows_html.append("<tr>")
+    for _, steps in active_zones:
+        for step in steps:
+            for period in ("Default", "Target"):
+                d = table_data[step][period]
+                n, pct = d["n"], d["pct"]
+                bg, fg = _cell_color(pct)
+                if n > 0:
+                    rows_html.append(
+                        f'<td style="{td};background:{bg};color:{fg}">'
+                        f'<div style="padding:6px 4px 2px;font-weight:bold;font-size:13px">'
+                        f'{pct:.2f}%</div>'
+                        f'<div style="padding:0 4px 6px;font-size:11px">{n}</div></td>'
+                    )
+                else:
+                    rows_html.append(f'<td style="{td};background:#f9f9f9"></td>')
+    rows_html.append("</tr>")
+
+    table_html = (
+        '<div style="overflow-x:auto;margin-top:8px">'
+        '<table style="border-collapse:collapse;font-family:sans-serif;width:max-content">'
+        + "".join(rows_html)
+        + "</table></div>"
+    )
 
     st.markdown("##### Price per day")
-    st.markdown(
-        "<span style='color:#4A86C8;font-size:18px'>■</span>&nbsp;<b>Default</b>&nbsp;&nbsp;&nbsp;"
-        "<span style='color:#F5A623;font-size:18px'>■</span>&nbsp;<b>Target</b>",
-        unsafe_allow_html=True,
-    )
     st.caption(
         f"Default (Before): **{total_b}** campaigns · "
         f"Target (After): **{total_a}** campaigns"
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.markdown(table_html, unsafe_allow_html=True)
 
     if scenario_code and scenario_code in _PPD_SCENARIOS:
         sc = _PPD_SCENARIOS[scenario_code]
